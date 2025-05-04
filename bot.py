@@ -143,7 +143,7 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         if not GEONAMES_USERNAME:
             logger.warning("GEONAMES_USERNAME not set. Kerykeion might have issues with city lookup.")
 
-        subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation, kerykeion_username=GEONAMES_USERNAME)
+        subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation)
 
         sun_info = subject_instance.sun
         sun_sign = sun_info['sign']
