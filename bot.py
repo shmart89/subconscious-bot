@@ -183,11 +183,15 @@ async def health_check_handler(request: web.Request):
 
 async def setup_bot_and_webhook(application: Application):
     """Sets up the bot webhook based on environment variables. Assumes application is initialized."""
-    base_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('BOT_BASE_URL')
+    # ვეძებთ ჯერ RAILWAY_PUBLIC_DOMAIN (თუ Railway-მ დაამატა), შემდეგ ჩვენს BOT_PUBLIC_URL-ს
+    # Railway ხშირად ამატებს RAILWAY_STATIC_URL ან მსგავსს, მაგრამ მოდი უნივერსალური გავხადოთ BOT_PUBLIC_URL-ით
+    base_url = os.environ.get('BOT_PUBLIC_URL') # ჩვენ ამ ცვლადს დავამატებთ Railway-ზე ხელით
+    # თუ გინდათ, რომ Render-ზეც იმუშაოს მომავალში, შეგიძლიათ დატოვოთ:
+    # base_url = os.environ.get('BOT_PUBLIC_URL') or os.environ.get('RENDER_EXTERNAL_URL')
     webhook_path = "/webhook" # სტანდარტული მისამართი Telegram განახლებებისთვის
 
     if not base_url:
-        logger.warning("Cannot determine base URL (RENDER_EXTERNAL_URL or BOT_BASE_URL not set). Webhook will NOT be set.")
+        logger.warning("Cannot determine base URL (BOT_PUBLIC_URL environment variable not set). Webhook will NOT be set.")
         return None # ვერ ვაყენებთ webhook-ს
 
     webhook_full_url = urljoin(base_url, webhook_path)
