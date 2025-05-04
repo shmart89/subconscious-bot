@@ -167,19 +167,16 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --- Webhook და Web Server-ის ლოგიკა ---
 
 async def telegram_webhook_handler(request: web.Request):
-    """Telegram-ისგან მიღებული განახლებების დამმუშავებელი"""
-    application = request.app['bot_app']
+    """TEMPORARY DEBUGGING HANDLER"""
     try:
-        update_data = await request.json()
-        update = TelegramUpdate.de_json(update_data, application.bot)
-        logger.info(f"Received update via webhook: {update.update_id}")
-        asyncio.create_task(application.process_update(update))
-        return web.Response(status=200)
-    except json.JSONDecodeError:
-         logger.error("Webhook received non-JSON data.")
-         return web.Response(status=400, text="Invalid JSON")
+        # Just log that we received something and what path it came to
+        body_snippet = await request.text()
+        body_snippet = body_snippet[:150] # ლოგისთვის მხოლოდ დასაწყისი ავიღოთ
+        logger.info(f"--- DEBUG: Webhook handler reached! --- Path: {request.path}, Method: {request.method}, Body starts with: {body_snippet}")
+        # დავაბრუნოთ მარტივი პასუხი, რომ Telegram-მა ნახოს, რომ მივიღეთ
+        return web.Response(status=200, text="OK - Request Received")
     except Exception as e:
-        logger.error(f"Error processing update from webhook: {e}", exc_info=True)
+        logger.error(f"ERROR in simplified webhook handler: {e}", exc_info=True)
         return web.Response(status=500)
 
 async def health_check_handler(request: web.Request):
