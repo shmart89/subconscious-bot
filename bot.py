@@ -3,7 +3,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin # ისევ დაგვჭირდება
 
 from aiohttp import web # ვებ სერვერისთვის
 from dotenv import load_dotenv
@@ -22,8 +22,8 @@ load_dotenv()
 
 # --- კონფიგურაცია ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Gemini ჯერ არ გამოიყენება, მაგრამ დავტოვოთ
-GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME") # Kerykeion-ს შეიძლება დასჭირდეს, თუ ჩართულია
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME")
 
 # Web App URL
 WEBAPP_URL = "https://shmart89.github.io/subconscious-bot/natal_form.html"
@@ -33,11 +33,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("kerykeion").setLevel(logging.WARNING) # Kerykeion-ის ლოგირების დონის დაწევა
+logging.getLogger("kerykeion").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- ბრძანებების და WebApp-ის დამმუშავებელი ფუნქციები ---
-
+# (start, natal_chart_webapp, web_app_data ფუნქციები უცვლელია - აქ არ დავაკოპირებ ადგილის დასაზოგად)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles the /start command."""
     user = update.effective_user
@@ -71,7 +71,6 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     data_str = update.effective_message.web_app_data.data
     chat_id = update.effective_chat.id
     logger.info(f"Received web app data for chat_id {chat_id}: {data_str}")
-    # ვაგზავნით "processing" შეტყობინებას დაუყოვნებლივ
     processing_message = await context.bot.send_message(chat_id=chat_id, text="მონაცემები მიღებულია, ვიწყებ დამუშავებას...")
 
     try:
@@ -87,7 +86,6 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             missing_fields = [f for f, v in {'name': name, 'birthdate': birthdate_str, 'birthtime': birthtime_str, 'city': city}.items() if not v]
             raise ValueError(f"არასრული მონაცემები ფორმიდან. აკლია: {', '.join(missing_fields)}")
 
-        # თარიღის და დროის გარდაქმნა
         try:
             birth_dt = datetime.strptime(f"{birthdate_str} {birthtime_str}", "%Y-%m-%d %H:%M")
             year = birth_dt.year
@@ -103,20 +101,13 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         if not GEONAMES_USERNAME:
             logger.warning("GEONAMES_USERNAME not set. Kerykeion might have issues with city lookup.")
 
-        # --- Kerykeion-ის გამოძახება ---
-        # შენიშვნა: Kerykeion-ის გამოძახებამ (განსაკუთრებით ქალაქის ძებნამ GeoNames-ით)
-        # შეიძლება გამოიწვიოს blocking I/O. ასინქრონულ გარემოში, როგორიც aiohttp-ია,
-        # იდეალურია ასეთი ოპერაციების გაშვება ცალკე thread-ში (მაგ. asyncio.to_thread).
-        # ამ ეტაპზე, სიმარტივისთვის, დავტოვოთ პირდაპირ გამოძახება.
         try:
             subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation, kerykeion_username=GEONAMES_USERNAME)
         except Exception as kerykeion_err:
              logger.error(f"Kerykeion calculation failed for {name}: {kerykeion_err}", exc_info=True)
-             # შეგვიძლია გავაგზავნოთ უფრო კონკრეტული შეცდომა მომხმარებელთან
              await processing_message.edit_text(f"ასტროლოგიური მონაცემების გამოთვლისას მოხდა შეცდომა: {kerykeion_err}. შეამოწმეთ ქალაქის სახელი.")
-             return # ვწყვეტთ ფუნქციის მუშაობას
+             return
 
-        # --- შედეგების ფორმირება ---
         sun_info = subject_instance.sun
         sun_sign = sun_info['sign']
         sun_position = f"{sun_info['position']:.2f}°"
@@ -154,25 +145,22 @@ async def web_app_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
 
         logger.info(f"AstrologicalSubject generated successfully for {name}.")
-        # ვცვლით "processing" შეტყობინებას საბოლოო პასუხით
         await processing_message.edit_text(text=response_text)
 
-    # --- შეცდომების დაჭერა ---
     except json.JSONDecodeError:
         logger.error(f"Failed to decode JSON from Web App: {data_str}")
         await processing_message.edit_text(text="ვებ აპლიკაციიდან მიღებული მონაცემების დამუშავება ვერ მოხერხდა (JSON შეცდომა).")
     except ValueError as ve:
         logger.error(f"Data processing error: {ve}")
         await processing_message.edit_text(text=f"მონაცემების დამუშავების შეცდომა: {ve}. გთხოვთ, შეამოწმოთ შეყვანილი მონაცემები ფორმაში.")
-    except ConnectionError as ce: # ეს შეიძლება მოხდეს Kerykeion-ის GeoNames-თან დაკავშირებისას
+    except ConnectionError as ce:
         logger.error(f"Kerykeion ConnectionError: {ce}")
         await processing_message.edit_text(text=f"Kerykeion კავშირის შეცდომა (სავარაუდოდ GeoNames): {ce}. შეამოწმეთ ინტერნეტ კავშირი ან სცადეთ მოგვიანებით.")
     except Exception as e:
         logger.error(f"An unexpected error occurred processing web app data for chat_id {chat_id}: {e}", exc_info=True)
-        # ვცდილობთ შეცდომის შეტყობინების რედაქტირებას, თუ შესაძლებელია
         try:
             await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა მონაცემების დამუშავებისას.")
-        except Exception: # თუ საწყისი შეტყობინების რედაქტირებაც ვერ ხერხდება
+        except Exception:
              await context.bot.send_message(chat_id=chat_id, text="მოულოდნელი შეცდომა მოხდა მონაცემების დამუშავებისას.")
 
 
@@ -185,9 +173,8 @@ async def telegram_webhook_handler(request: web.Request):
         update_data = await request.json()
         update = TelegramUpdate.de_json(update_data, application.bot)
         logger.info(f"Received update via webhook: {update.update_id}")
-        # განახლების ასინქრონულად დამუშავება, რათა Telegram-ს სწრაფად ვუპასუხოთ 200 OK
         asyncio.create_task(application.process_update(update))
-        return web.Response(status=200) # დაუყოვნებლივ ვაბრუნებთ 200 OK-ს
+        return web.Response(status=200)
     except json.JSONDecodeError:
          logger.error("Webhook received non-JSON data.")
          return web.Response(status=400, text="Invalid JSON")
@@ -199,29 +186,28 @@ async def health_check_handler(request: web.Request):
     """Render/Railway-სთვის health check წერტილი"""
     return web.Response(text="OK", status=200)
 
+
 async def setup_bot_and_webhook(application: Application):
-    """Sets up the bot webhook (listening on root path /) based on environment variables."""
-    # ვეძებთ BOT_PUBLIC_URL ცვლადს, რომელსაც ხელით ვამატებთ ჰოსტინგზე
+    """Sets up the bot webhook (listening on /telegram path) based on environment variables."""
     base_url = os.environ.get('BOT_PUBLIC_URL')
-    webhook_path = "/" # ვუსმენთ ძირითად მისამართზე
+    webhook_path = "/telegram" # <-- შევცვალეთ მისამართი
 
     if not base_url:
         logger.warning("Cannot determine base URL (BOT_PUBLIC_URL environment variable not set). Webhook will NOT be set.")
-        return None # ვერ ვაყენებთ webhook-ს
+        return None
 
-    # დავრწმუნდეთ, რომ base_url-ს ბოლოში / არ აქვს, რადგან Telegram-ს პირდაპირ აქ ვუთითებთ
-    webhook_target_url = base_url.rstrip('/')
+    # სრული Webhook URL-ის შექმნა urljoin-ით
+    webhook_full_url = urljoin(base_url, webhook_path)
 
-    logger.info(f"Attempting to set webhook to target URL: {webhook_target_url}")
+    logger.info(f"Attempting to set webhook to: {webhook_full_url}") # <-- ლოგირება სრული URL-ით
     try:
         await application.bot.set_webhook(
-            url=webhook_target_url, # Telegram-ი გამოაგზავნის POST-ს პირდაპირ აქ
-            allowed_updates=["message"], # ჩვენ გვჭირდება მხოლოდ message განახლებები (მათ შორის web_app_data)
-            drop_pending_updates=True # ვუთხრათ Telegram-ს, რომ წაშალოს დაგროვილი განახლებები (თუ ბოტი გათიშული იყო)
-            # secret_token="YOUR_SECRET_TOKEN" # დამატებითი უსაფრთხოებისთვის
+            url=webhook_full_url, # <-- ვიყენებთ სრულ URL-ს path-ით
+            allowed_updates=["message"],
+            drop_pending_updates=True
         )
-        logger.info(f"Webhook successfully set to {webhook_target_url}")
-        return webhook_path # ვაბრუნებთ "/" გზას aiohttp როუტერისთვის
+        logger.info(f"Webhook successfully set to {webhook_full_url}")
+        return webhook_path # <-- ვაბრუნებთ "/telegram" გზას როუტერისთვის
     except Exception as e:
         logger.error(f"Failed to set webhook: {e}", exc_info=True)
         return None
@@ -235,7 +221,7 @@ async def main_async() -> None:
     logger.info("Creating application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # ბრძანებების და WebApp handler-ის რეგისტრაცია
+    # Handler-ების რეგისტრაცია
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("natalchart", natal_chart_webapp))
     application.add_handler(MessageHandler(filters.StatusUpdate.WEB_APP_DATA, web_app_data))
@@ -247,15 +233,15 @@ async def main_async() -> None:
     logger.info("Application initialized.")
 
     # Webhook-ის დაყენების მცდელობა
-    webhook_path = await setup_bot_and_webhook(application)
+    webhook_path = await setup_bot_and_webhook(application) # <-- აქ დაგვიბრუნდება "/telegram" ან None
 
     # aiohttp ვებ სერვერის შექმნა
     aiohttp_app = web.Application()
-    aiohttp_app['bot_app'] = application # ვინახავთ application ობიექტს, რომ handler-მა გამოიყენოს
+    aiohttp_app['bot_app'] = application
 
     # Handler-ების დამატება კონკრეტულ მისამართებზე
-    if webhook_path: # Webhook handler-ი ემატება მხოლოდ თუ webhook წარმატებით დაყენდა
-         aiohttp_app.router.add_post(webhook_path, telegram_webhook_handler) # დაემატება "/" მისამართზე
+    if webhook_path: # დავამატოთ webhook handler-ი მხოლოდ თუ webhook წარმატებით დაყენდა
+         aiohttp_app.router.add_post(webhook_path, telegram_webhook_handler) # <-- დაემატება "/telegram" მისამართზე
          logger.info(f"Webhook handler registered at path: {webhook_path}")
     else:
          logger.warning("Webhook path could not be determined or set. Telegram webhook handler NOT registered.")
@@ -263,7 +249,7 @@ async def main_async() -> None:
     logger.info("Health check handler registered at path: /health")
 
     # ვებ სერვერის გაშვება
-    port = int(os.environ.get('PORT', 8080)) # Railway/Render იყენებს PORT ცვლადს, ლოკალურად 8080 იყოს default
+    port = int(os.environ.get('PORT', 8080))
     runner = web.AppRunner(aiohttp_app)
     await runner.setup()
     site = web.TCPSite(runner, host='0.0.0.0', port=port)
@@ -271,7 +257,7 @@ async def main_async() -> None:
     logger.info(f"Starting web server on host 0.0.0.0 port {port}...")
     await site.start()
 
-    # ბოტის შიდა პროცესების გაშვება (პოლინგის გარეშე)
+    # ბოტის შიდა პროცესების გაშვება
     await application.start()
     logger.info("Bot application started in webhook mode.")
 
