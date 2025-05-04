@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Natal Chart Data</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <style>
+        body { font-family: sans-serif; padding: 15px; background-color: var(--tg-theme-bg-color, white); color: var(--tg-theme-text-color, black); }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input[type="text"], input[type="date"], input[type="time"] {
+            width: calc(100% - 22px); /* Adjust width for padding/border */
+            padding: 10px;
+            border: 1px solid var(--tg-theme-hint-color, #ccc);
+            border-radius: 5px;
+            background-color: var(--tg-theme-secondary-bg-color, #f8f8f8);
+            color: var(--tg-theme-text-color, black);
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--tg-theme-button-color, #007bff);
+            color: var(--tg-theme-button-text-color, white);
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover { opacity: 0.9; }
+        /* Hide the default submit button if using Telegram's MainButton */
+        /* #submit-button { display: none; } */
+    </style>
+</head>
+<body>
+
+    <h1>Enter Birth Details</h1>
+    <form id="natal-form">
+        <div class="form-group">
+            <label for="name">Name:</label>
+            <input type="text" id="name" name="name" placeholder="Enter name" required>
+        </div>
+        <div class="form-group">
+            <label for="birthdate">Date of Birth:</label>
+            <input type="date" id="birthdate" name="birthdate" required>
+        </div>
+        <div class="form-group">
+            <label for="birthtime">Time of Birth:</label>
+            <input type="time" id="birthtime" name="birthtime" required>
+        </div>
+        <div class="form-group">
+            <label for="city">City of Birth:</label>
+            <input type="text" id="city" name="city" placeholder="e.g., Tbilisi, Kutaisi" required>
+        </div>
+        <div class="form-group">
+            <label for="nation">Country Code (Optional):</label>
+            <input type="text" id="nation" name="nation" placeholder="e.g., GE">
+        </div>
+
+        <button type="submit" id="submit-button">Get Natal Chart</button>
+    </form>
+
+    <script>
+        // Initialize the Telegram Web App interface
+        Telegram.WebApp.ready();
+
+        const form = document.getElementById('natal-form');
+        const submitButton = document.getElementById('submit-button'); // Standard button
+
+        // --- Option 1: Using standard HTML submit button ---
+        form.addEventListener('submit', function(event) {
+            event.preventDefault(); // Prevent default form submission
+
+            const formData = {
+                name: document.getElementById('name').value,
+                birthdate: document.getElementById('birthdate').value, // "YYYY-MM-DD"
+                birthtime: document.getElementById('birthtime').value, // "HH:MM"
+                city: document.getElementById('city').value,
+                nation: document.getElementById('nation').value || "GE" // Default to GE if empty
+            };
+
+            // Basic validation (ensure fields aren't empty - covered by 'required')
+            if (formData.name && formData.birthdate && formData.birthtime && formData.city) {
+                // Send data to the bot
+                Telegram.WebApp.sendData(JSON.stringify(formData));
+                // Optionally close the web app window after sending
+                 Telegram.WebApp.close();
+            } else {
+                 // This part might not be reached due to 'required' attribute
+                Telegram.WebApp.showAlert('Please fill in all required fields.');
+            }
+        });
+
+        // --- Option 2: Using Telegram's Main Button (Uncomment to use) ---
+        /*
+        Telegram.WebApp.MainButton.text = "Get Natal Chart";
+        Telegram.WebApp.MainButton.textColor = "#FFFFFF"; // White text
+        Telegram.WebApp.MainButton.color = "#007bff";    // Blue background (Telegram default)
+        Telegram.WebApp.MainButton.show();
+
+        Telegram.WebApp.MainButton.onClick(function() {
+            const formData = {
+                name: document.getElementById('name').value,
+                birthdate: document.getElementById('birthdate').value,
+                birthtime: document.getElementById('birthtime').value,
+                city: document.getElementById('city').value,
+                nation: document.getElementById('nation').value || "GE"
+            };
+
+            if (formData.name && formData.birthdate && formData.birthtime && formData.city) {
+                Telegram.WebApp.sendData(JSON.stringify(formData));
+                 Telegram.WebApp.close();
+            } else {
+                Telegram.WebApp.showAlert('Please fill in all required fields.');
+            }
+        });
+        // If using MainButton, you might want to hide the standard HTML button via CSS
+        */
+
+    </script>
+
+</body>
+</html>
