@@ -1,4 +1,3 @@
 python-telegram-bot[ext]
 python-dotenv
 kerykeion
-aiohttp  # ვებ სერვერისთვის (Webhook-ისთვის)
