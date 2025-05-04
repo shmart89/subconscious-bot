@@ -102,3 +102,4 @@ celerybeat.pid
 
 # VSCode files
 .vscode/
+cache/
