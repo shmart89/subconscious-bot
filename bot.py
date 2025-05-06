@@ -6,7 +6,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 import asyncio
-import re # დაგვჭირდება Gemini-ს პასუხის დასამუშავებლად
+import re
 
 # --- Gemini AI Setup ---
 import google.generativeai as genai
@@ -27,7 +27,9 @@ from telegram.ext import (
     CallbackQueryHandler,
 )
 
-from kerykeion import AstrologicalSubject, NatalAspects # დაგვჭირდება ასპექტებისთვის
+# Kerykeion იმპორტი და ასპექტების კლასი
+from kerykeion import AstrologicalSubject, NatalAspects
+from kerykeion.kr_types import KerykeionException # შეცდომის დასაჭერად
 
 # .env ფაილიდან გარემოს ცვლადების ჩატვირთვა
 load_dotenv()
@@ -35,20 +37,20 @@ load_dotenv()
 # --- კონფიგურაცია ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME")
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME") # !!! მნიშვნელოვანია ამის დაყენება .env-ში !!!
 DB_FILE = "user_data.db"
 TELEGRAM_MESSAGE_LIMIT = 4096
 
 # ასპექტების კონფიგურაცია
-ASPECT_PLANETS = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven'] # რომელი პლანეტების ასპექტები გვინდა
-MAJOR_ASPECTS = ['conjunction', 'opposition', 'square', 'trine', 'sextile'] # რომელი ასპექტები
-ASPECT_ORBS = {'Sun': 8, 'Moon': 8, 'Ascendant': 5, 'Midheaven': 5, 'default': 6} # ორბისები (შეიძლება დახვეწა)
+ASPECT_PLANETS = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven']
+MAJOR_ASPECTS = ['conjunction', 'opposition', 'square', 'trine', 'sextile']
+ASPECT_ORBS = {'Sun': 8, 'Moon': 8, 'Ascendant': 5, 'Midheaven': 5, 'default': 6}
 
 # --- Gemini კონფიგურაცია ---
 gemini_model = None
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    safety_settings = [ # ვცადოთ უფრო რბილი პარამეტრები
+    safety_settings = [
         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
@@ -56,16 +58,14 @@ if GEMINI_API_KEY:
     ]
     try:
         gemini_model = genai.GenerativeModel(
-            'gemini-1.5-flash-latest', # ან 'gemini-1.5-pro-latest' უფრო მაღალი ხარისხისთვის (და ფასისთვის)
+            'gemini-1.5-flash-latest',
             safety_settings=safety_settings
         )
         logging.info("Gemini model loaded successfully.")
     except Exception as e:
          logging.error(f"Failed to load Gemini model: {e}", exc_info=True)
-
 else:
     logging.warning("GEMINI_API_KEY not found in environment variables. AI features will be disabled.")
-
 
 # ლოგირების ჩართვა
 logging.basicConfig(
@@ -75,7 +75,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("kerykeion").setLevel(logging.WARNING)
 logging.getLogger("google.generativeai").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
-
 
 # --- მონაცემთა ბაზის ფუნქციები ---
 # (init_db, save_user_data, get_user_data, delete_user_data - უცვლელია)
@@ -158,89 +157,71 @@ def delete_user_data(user_id: int):
 planet_emojis = {
     "Sun": "☀️", "Moon": "🌙", "Mercury": "☿️", "Venus": "♀️", "Mars": "♂️",
     "Jupiter": "♃", "Saturn": "♄", "Uranus": "♅", "Neptune": "♆", "Pluto": "♇",
-    "Ascendant": "⬆️", "Midheaven": "🏡", # Asc/MC
+    "Ascendant": "⬆️", "Midheaven": " Mᶜ", # MC - Midheaven
 }
 aspect_translations = {
     "conjunction": "შეერთება", "opposition": "ოპოზიცია", "square": "კვადრატი",
     "trine": "ტრიგონი", "sextile": "სექსტილი"
 }
-aspect_symbols = { # უნიკოდ სიმბოლოები
+aspect_symbols = {
     "conjunction": "☌", "opposition": "☍", "square": "□",
     "trine": "△", "sextile": "∗"
 }
 
 # --- Gemini-სთან კომუნიკაციის ფუნქცია ---
+# (get_gemini_interpretation - უცვლელია)
 async def get_gemini_interpretation(prompt: str) -> str:
-    """Calls Gemini API asynchronously to get interpretation."""
     if not gemini_model:
         return "(Gemini API მიუწვდომელია)"
     try:
-        # ვზრდით timeout-ს, რადგან ვრცელი პასუხი გვინდა
-        request_options = {"timeout": 120} # 2 წუთი
+        request_options = {"timeout": 120}
         response = await gemini_model.generate_content_async(
             prompt,
-            generation_config={"response_mime_type": "text/plain"}, # მოვითხოვოთ სუფთა ტექსტი
+            generation_config={"response_mime_type": "text/plain"},
             request_options=request_options
             )
-
-        # უფრო დეტალური შემოწმება დაბლოკვაზე/ცარიელ პასუხზე
         if not response.candidates:
             feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else None
             block_reason = feedback.block_reason if hasattr(feedback, 'block_reason') else 'Unknown'
             safety_ratings = feedback.safety_ratings if hasattr(feedback, 'safety_ratings') else 'N/A'
             logger.warning(f"Gemini response blocked or empty. Prompt: '{prompt[:100]}...'. Reason: {block_reason}, Ratings: {safety_ratings}")
             return f"(Gemini-მ პასუხი დაბლოკა ან ცარიელია. მიზეზი: {block_reason})"
-
         if hasattr(response.candidates[0].content, 'parts') and response.candidates[0].content.parts:
              full_text = "".join(part.text for part in response.candidates[0].content.parts)
              return full_text.strip()
         else:
             logger.warning(f"Gemini response candidate did not contain valid parts. Prompt: '{prompt[:100]}...'. Response: {response}")
             return "(Gemini-მ სტრუქტურული პასუხი არ დააბრუნა)"
-
     except generation_types.StopCandidateException as e:
          logger.warning(f"Gemini generation stopped: {e}. Prompt: '{prompt[:100]}...'")
          return "(Gemini-მ პასუხის გენერაცია შეწყვიტა)"
     except Exception as e:
-        # დავამატოთ შეცდომის ტიპის ლოგირება
         logger.error(f"Gemini API error ({type(e).__name__}): {e}", exc_info=True)
         return f"(ინტერპრეტაციის გენერირებისას მოხდა შეცდომა: {type(e).__name__})"
 
+
 # --- დამხმარე ფუნქცია ტექსტის ნაწილებად დასაყოფად ---
+# (split_text - უცვლელია)
 def split_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    """Splits text into chunks respecting Telegram's message length limit."""
     parts = []
-    while len(text.encode('utf-8')) > limit: # ვითვლით ბაიტებს და არა სიმბოლოებს
-        # ვპოულობთ ბოლო აბზაცს ლიმიტამდე (ბაიტებში)
-        split_pos_byte = -1
-        limit_bytes = limit - 10 # მცირე ზღვარი
+    while len(text.encode('utf-8')) > limit:
+        limit_bytes = limit - 10
         search_text_bytes = text.encode('utf-8')[:limit_bytes]
-
-        # ვეძებთ ბოლო \n\n-ს ბაიტებში
         split_pos_byte = search_text_bytes.rfind(b'\n\n')
-        if split_pos_byte == -1: # თუ ვერ ვიპოვეთ, ვეძებთ \n-ს
-            split_pos_byte = search_text_bytes.rfind(b'\n')
-        if split_pos_byte == -1: # თუ ვერც ეგ ვიპოვეთ, ვეძებთ წერტილს + ჰარს
-             split_pos_byte = search_text_bytes.rfind(b'. ')
-        if split_pos_byte == -1 or split_pos_byte < limit_bytes // 2: # თუ გამყოფი ვერ მოიძებნა ან ძალიან დასაწყისშია
-             # ვცადოთ უახლოესი ჰარით გაყოფა
+        if split_pos_byte == -1: split_pos_byte = search_text_bytes.rfind(b'\n')
+        if split_pos_byte == -1: split_pos_byte = search_text_bytes.rfind(b'. ')
+        if split_pos_byte == -1 or split_pos_byte < limit_bytes // 2 :
              split_pos_byte = search_text_bytes.rfind(b' ')
-             if split_pos_byte == -1: # უკიდურესი შემთხვევა
-                  split_pos_byte = limit_bytes # პირდაპირ ვჭრით
-
-        # გადავიყვანოთ ბაიტის პოზიცია სიმბოლოს პოზიციაში
+             if split_pos_byte == -1: split_pos_byte = limit_bytes
         split_pos_char = len(search_text_bytes[:split_pos_byte].decode('utf-8', errors='ignore'))
-
         parts.append(text[:split_pos_char])
-        text = text[split_pos_char:].lstrip() # ვშლით დასაწყის ჰარებს
-
-    parts.append(text) # ბოლო ნაწილი
-    if not parts[0]: # თუ პირველი ნაწილი ცარიელი გამოვიდა, დავბრუნოთ მხოლოდ მეორე
-         return [parts[1]] if len(parts) > 1 else []
+        text = text[split_pos_char:].lstrip()
+    parts.append(text)
+    if parts and not parts[0]: return parts[1:] if len(parts) > 1 else []
     return parts
 
 
-# --- რუკის გენერირების და გაგზავნის ფუნქცია (დიდი Prompt-ით) ---
+# --- რუკის გენერირების და გაგზავნის ფუნქცია (შესწორებული ასპექტებით) ---
 async def generate_and_send_chart(user_data: dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Generates natal chart using Kerykeion and gets interpretations from Gemini via a single prompt."""
     name = user_data.get('name', 'User')
@@ -263,50 +244,79 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         # --- Kerykeion-ის გამოთვლა ---
         if not GEONAMES_USERNAME:
             logger.warning("GEONAMES_USERNAME not set. Kerykeion might have issues with city lookup.")
-        try:
-            subject_instance = await asyncio.to_thread(
-                AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation
-            )
-            # ასპექტების გამოთვლა
-            aspect_calculator = NatalAspects(subject_instance, aspects_list=MAJOR_ASPECTS, planets=ASPECT_PLANETS, orb_dictionary=ASPECT_ORBS)
-            aspects_list = aspect_calculator.get_relevant_aspects() # ვიღებთ relevant ასპექტებს
+            await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: GeoNames მომხმარებლის სახელი არ არის დაყენებული. ქალაქის ძებნა შეიძლება ვერ მოხერხდეს.")
+            # აქ შეგვიძლია გავაგრძელოთ ან გავაჩეროთ, მომხმარებლის ინფორმირება ჯობს. გავაგრძელოთ ამ ეტაპზე.
 
+        try:
+            logger.info("Calculating AstrologicalSubject...")
+            # ვცადოთ asyncio.to_thread
+            subject_instance = await asyncio.to_thread(
+                AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation # აქ აღარ გადავცემთ kerykeion_username-ს
+            )
+            logger.info("AstrologicalSubject calculated.")
         except RuntimeError as e:
              logger.warning(f"asyncio.to_thread failed ({e}), calling Kerykeion directly.")
-             subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation)
-             aspect_calculator = NatalAspects(subject_instance, aspects_list=MAJOR_ASPECTS, planets=ASPECT_PLANETS, orb_dictionary=ASPECT_ORBS)
-             aspects_list = aspect_calculator.get_relevant_aspects()
+             subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation) # აქაც აღარ გადავცემთ
+             logger.info("AstrologicalSubject calculated directly.")
+        except KerykeionException as ke: # დავიჭიროთ ქალაქის ვერ პოვნის შეცდომა
+             logger.error(f"KerykeionException for {name}: {ke}")
+             await processing_message.edit_text(text=f"შეცდომა: Kerykeion-მა ვერ იპოვა მონაცემები ქალაქისთვის '{city}'. გთხოვთ, შეამოწმოთ ქალაქის სახელი და სცადოთ თავიდან /createchart.")
+             return # ვწყვეტთ მუშაობას
+        except Exception as keryk_err: # დავიჭიროთ სხვა Kerykeion შეცდომები
+             logger.error(f"Error creating AstrologicalSubject for {name}: {keryk_err}", exc_info=True)
+             await processing_message.edit_text(text="შეცდომა მოხდა ასტროლოგიური მონაცემების გამოთვლისას.")
+             return
 
-        logger.info(f"Kerykeion data generated successfully for {name}.")
+        # --- ასპექტების გამოთვლა (შესწორებული) ---
+        logger.info("Calculating aspects...")
+        try:
+             # !!! შესწორება: წაიშალა aspects_list პარამეტრი !!!
+             aspect_calculator = NatalAspects(subject_instance, planets=ASPECT_PLANETS, orb_dictionary=ASPECT_ORBS)
+             all_relevant_aspects = aspect_calculator.get_relevant_aspects()
+             logger.info(f"Found {len(all_relevant_aspects)} relevant aspects based on orbs.")
+
+             # ვფილტრავთ მხოლოდ მაჟორულ ასპექტებს ჩვენი სიიდან
+             filtered_aspects = [
+                 asp for asp in all_relevant_aspects
+                 if asp.get('aspect') in MAJOR_ASPECTS
+             ]
+             logger.info(f"Filtered down to {len(filtered_aspects)} major aspects.")
+        except Exception as aspect_err:
+             logger.error(f"Error calculating aspects for {name}: {aspect_err}", exc_info=True)
+             filtered_aspects = [] # თუ ასპექტების გამოთვლა ვერ მოხერხდა, სია ცარიელი იქნება
+             await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: ასპექტების გამოთვლისას მოხდა შეცდომა.")
+
 
         # --- მონაცემების მომზადება Prompt-ისთვის ---
         planets_data_str = ""
         planet_list_for_prompt = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven']
         for planet_name in planet_list_for_prompt:
             try:
-                 planet_obj = getattr(subject_instance, planet_name.lower().replace('midheaven', 'mc')) # MC-სთვის kerykeion-ში mc გამოიყენება
+                 obj_name_in_kerykeion = planet_name.lower().replace('midheaven', 'mc')
+                 planet_obj = getattr(subject_instance, obj_name_in_kerykeion)
                  sign = planet_obj.get('sign', '?')
                  pos = planet_obj.get('position', 0.0)
-                 house = planet_obj.get('house', '?')
+                 house = planet_obj.get('house', '?') # სახლი შეიძლება "?" იყოს, თუ ვერ გამოითვალა
                  retro = " (R)" if planet_obj.get('isRetro') == 'true' else ""
-                 planets_data_str += f"- {planet_name}: {sign} {pos:.2f}°, {house}-ე სახლი{retro}\n"
+                 # სახლის დამატება ტექსტში
+                 house_str = f", {house}-ე სახლი" if isinstance(house, int) else ""
+                 planets_data_str += f"- {planet_name}: {sign} {pos:.2f}°{house_str}{retro}\n"
             except Exception as e:
                  logger.error(f"Error getting data for {planet_name}: {e}")
                  planets_data_str += f"- {planet_name}: მონაცემების წაკითხვის შეცდომა\n"
 
         aspects_data_str = ""
-        if aspects_list:
-            for aspect in aspects_list:
+        if filtered_aspects:
+            for aspect in filtered_aspects:
                 p1 = aspect.get('p1_name')
                 p2 = aspect.get('p2_name')
                 aspect_type = aspect.get('aspect')
                 orb = aspect.get('orbit', 0.0)
-                aspect_name_ge = aspect_translations.get(aspect_type, aspect_type) # ვთარგმნით სახელს
-                if p1 and p2 and aspect_name_ge: # გამოვრიცხოთ არასრული მონაცემები
-                    aspects_data_str += f"- {p1} {aspect_name_ge} {p2} ({orb:.1f}°)\n"
-        else:
-             aspects_data_str = "- მნიშვნელოვანი ასპექტები ვერ მოიძებნა.\n"
-
+                if p1 and p2 and aspect_type:
+                     aspect_name_ge = aspect_translations.get(aspect_type, aspect_type)
+                     aspects_data_str += f"- {p1} {aspect_name_ge} {p2} ({orb:.1f}°)\n"
+        if not aspects_data_str:
+             aspects_data_str = "- მნიშვნელოვანი მაჟორული ასპექტები ვერ მოიძებნა მითითებული ორბისებით.\n"
 
         # --- დიდი Prompt-ის შექმნა ---
         large_prompt = f"""შენ ხარ გამოცდილი, პროფესიონალი ასტროლოგი, რომელიც წერს სიღრმისეულ და დეტალურ ნატალური რუკის ანალიზს ქართულ ენაზე.
@@ -331,22 +341,21 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
 (აქ დაწერე დეტალური ანალიზი თითოეული პლანეტისთვის (Sun-Pluto) მის ნიშანში. თითოეულზე 3-4 წინადადება მინიმუმ.)
 
 [SECTION: PlanetsInHouses]
-(აქ დაწერე დეტალური ანალიზი თითოეული პლანეტისთვის (Sun-Pluto) მის სახლში. თითოეულზე 3-4 წინადადება მინიმუმ.)
+(აქ დაწერე დეტალური ანალიზი თითოეული პლანეტისთვის (Sun-Pluto) მის სახლში, თუ სახლის ნომერი ცნობილია. თითოეულზე 3-4 წინადადება მინიმუმ.)
 
 [SECTION: Aspects]
 (აქ დაწერე დეტალური ანალიზი თითოეული ჩამოთვლილი ასპექტისთვის. თითოეულზე 3-4 წინადადება მინიმუმ.)
 
-გთხოვ, პასუხი დააბრუნო მხოლოდ ამ სამი სექციის ტექსტით, დაწყებული `[SECTION: PlanetsInSigns]`-ით.
+გთხოვ, პასუხი დააბრუნო მხოლოდ ამ სამი სექციის ტექსტით, დაწყებული `[SECTION: PlanetsInSigns]`-ით. არ დაამატო შესავალი ან დასკვნითი სიტყვები.
 """
 
         # --- Gemini-ს გამოძახება ---
-        await processing_message.edit_text(text="""მონაცემები გამოთვლილია. ვიწყებ დეტალური ინტერპრეტაციების გენერირებას Gemini-სთან...
+        await processing_message.edit_text(text="""ასტროლოგიური მონაცემები გამოთვლილია. ვიწყებ დეტალური ინტერპრეტაციების გენერირებას Gemini-სთან...
 ⏳ ამას შეიძლება 1-2 წუთი დასჭირდეს.""", parse_mode=ParseMode.HTML)
 
         logger.info(f"Sending large prompt to Gemini for user {chat_id}")
         full_interpretation_text = await get_gemini_interpretation(large_prompt)
         logger.info(f"Received full interpretation from Gemini for user {chat_id}. Length: {len(full_interpretation_text)}")
-
 
         # --- Gemini-ს პასუხის დამუშავება და ფორმატირება ---
         final_report_parts = []
@@ -355,9 +364,8 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         base_info_text = (
             f"✨ {name}-ს ნატალური რუკა ✨\n\n"
             f"<b>დაბადების მონაცემები:</b> {day}/{month}/{year}, {hour:02d}:{minute:02d}, {city}{f', {nation}' if nation else ''}\n"
-            f"<b>ზოდიაქო:</b> ტროპიკული, <b>სახლები:</b> პლაციდუსი\n\n" # დაემატა სისტემები
+            f"<b>ზოდიაქო:</b> ტროპიკული, <b>სახლები:</b> პლაციდუსი\n\n"
         )
-        # დავამატოთ მზე და ასცედენტი აქაც
         try: sun_info = subject_instance.sun; base_info_text += f"☀️ <b>მზე:</b> {sun_info['sign']} (<code>{sun_info['position']:.2f}°</code>)\n"
         except: pass
         try: asc_info = subject_instance.ascendant; base_info_text += f"⬆️ <b>ასცედენტი:</b> {asc_info['sign']} (<code>{asc_info['position']:.2f}°</code>)\n"
@@ -367,9 +375,10 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         final_report_parts.append(base_info_text)
 
         # 2. ვპოულობთ სექციებს Gemini-ს ტექსტში
-        planets_in_signs_match = re.search(r"\[SECTION: PlanetsInSigns\](.*?)(\[SECTION: |$)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
-        planets_in_houses_match = re.search(r"\[SECTION: PlanetsInHouses\](.*?)(\[SECTION: |$)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
-        aspects_match = re.search(r"\[SECTION: Aspects\](.*?)$", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+        # გამოვიყენოთ re.IGNORECASE და გავაუმჯობესოთ პატერნი
+        planets_in_signs_match = re.search(r"\[SECTION:\s*PlanetsInSigns\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+        planets_in_houses_match = re.search(r"\[SECTION:\s*PlanetsInHouses\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+        aspects_match = re.search(r"\[SECTION:\s*Aspects\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
 
         # 3. ვამატებთ სექციებს ფორმატირებით
         if planets_in_signs_match:
@@ -384,23 +393,28 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
 
         if aspects_match:
             text = aspects_match.group(1).strip()
-            # დავამატოთ ასპექტების სიმბოლოები? (რთულია ტექსტში ჩასმა)
             if text: final_report_parts.append(f"\n--- ✨ <b>ასპექტები</b> ---\n\n{text}")
         else: logger.warning("Could not parse [SECTION: Aspects] from Gemini response.")
 
-        # თუ ვერცერთი სექცია ვერ ვიპოვეთ, ვაჩვენოთ მთლიანი ტექსტი (ან შეცდომა)
-        if len(final_report_parts) == 1: # თუ მხოლოდ base_info_text დარჩა
-            if full_interpretation_text.startswith("("): # თუ Gemini-მ შეცდომა დააბრუნა
+        # თუ სექციები ვერ ვიპოვეთ, ან თუ Gemini-მ შეცდომა დააბრუნა
+        if len(final_report_parts) == 1:
+            if full_interpretation_text.startswith("("): # Gemini-ს შეცდომის ტექსტი
                  final_report_parts.append(f"\n<b>ინტერპრეტაცია ვერ მოხერხდა:</b>\n{full_interpretation_text}")
-            else: # თუ ტექსტი არის, მაგრამ სექციები ვერ ვიპოვეთ
+            elif len(full_interpretation_text) > 10: # თუ ტექსტი არის, მაგრამ ტეგები არ/ვერ დაიცვა
+                 logger.warning("Could not parse sections, showing raw Gemini text.")
                  final_report_parts.append(f"\n<b>ინტერპრეტაცია (დაუმუშავებელი):</b>\n{full_interpretation_text}")
-
+            # თუ ცარიელი პასუხია, არაფერს ვამატებთ
 
         # --- საბოლოო პასუხის გაგზავნა (ნაწილებად) ---
-        full_response_text = "".join(final_report_parts)
-        parts = split_text(full_response_text)
+        full_response_text = "".join(final_report_parts).strip()
 
+        if not full_response_text or full_response_text == base_info_text.strip(): # თუ მხოლოდ ბაზის ინფო დარჩა
+            await processing_message.edit_text(text="ინტერპრეტაციების გენერირება ვერ მოხერხდა.")
+            return
+
+        parts = split_text(full_response_text)
         logger.info(f"Sending response in {len(parts)} parts.")
+
         # პირველ ნაწილს ვარედაქტირებთ
         await processing_message.edit_text(text=parts[0], parse_mode=ParseMode.HTML)
         # დანარჩენს ვგზავნით ახალ შეტყობინებებად
@@ -410,19 +424,23 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         logger.info(f"Full detailed chart sent for {name}.")
 
     # --- შეცდომების დაჭერა ---
+    except KerykeionException as ke: # დავიჭიროთ Kerykeion შეცდომები ცალკე
+        logger.error(f"KerykeionException for {name}: {ke}", exc_info=True)
+        await processing_message.edit_text(text=f"შეცდომა ასტროლოგიური მონაცემების გამოთვლისას: {ke}. გთხოვთ, შეამოწმოთ შეყვანილი მონაცემები, განსაკუთრებით ქალაქი.")
     except ConnectionError as ce:
-        logger.error(f"Kerykeion ConnectionError for {name}: {ce}")
-        await processing_message.edit_text(text=f"Kerykeion კავშირის შეცდომა (სავარაუდოდ GeoNames): {ce}. შეამოწმეთ ინტერნეტ კავშირი ან სცადეთ მოგვიანებით.")
+        logger.error(f"ConnectionError during chart generation for {name}: {ce}")
+        await processing_message.edit_text(text=f"კავშირის შეცდომა მოხდა (სავარაუდოდ GeoNames ან Gemini). სცადეთ მოგვიანებით.")
     except Exception as e:
         logger.error(f"An unexpected error occurred generating chart for {name}: {e}", exc_info=True)
         try:
-            await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
+            await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას: {type(e).__name__}")
         except Exception:
              await context.bot.send_message(chat_id=chat_id, text="მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
 
 
 # --- Handler ფუნქციები ---
-# (start, create_chart_start, handle_saved_data_choice, handle_name, handle_year, handle_month, handle_day, handle_hour, handle_minute, handle_city, handle_nation, skip_nation, cancel, show_my_data, delete_data - უცვლელია)
+# (start, create_chart_start, handle_saved_data_choice, handle_name, ..., cancel, show_my_data, delete_data - უცვლელია)
+# (აქ აღარ ჩავსვი ადგილის დასაზოგად, გამოიყენეთ წინა ვერსიიდან)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     user_data = get_user_data(user.id)
@@ -436,7 +454,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         start_text += "\n\nნატალური რუკის შესაქმნელად გამოიყენეთ /createchart ბრძანება."
     await update.message.reply_html(start_text)
 
-# Conversation states
 (NAME, YEAR, MONTH, DAY, HOUR, MINUTE, CITY, NATION, SAVED_DATA_CHOICE) = range(9)
 
 async def create_chart_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -649,16 +666,16 @@ async def delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         await update.message.reply_text("მონაცემების წაშლისას მოხდა შეცდომა ან მონაცემები არ არსებობდა.")
 
+
 # --- მთავარი ფუნქცია ---
 def main() -> None:
     """Start the bot in polling mode."""
     init_db()
-
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("Error: TELEGRAM_BOT_TOKEN environment variable not set. Bot cannot start.")
         return
-    if not GEMINI_API_KEY:
-         logger.warning("Warning: GEMINI_API_KEY environment variable not set. AI features will be disabled.")
+    if not gemini_model: # შევამოწმოთ მოდელი ჩაიტვირთა თუ არა
+         logger.warning("Gemini model not loaded (check API key?). AI features will be disabled in responses.")
 
     logger.info("Creating application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
