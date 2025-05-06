@@ -1,13 +1,17 @@
 import os
 import json
 import logging
-import sqlite3 # <-- მონაცემთა ბაზისთვის
+import sqlite3
 from datetime import datetime
-from pathlib import Path # <-- ფაილის გზისთვის
+from pathlib import Path
+import asyncio # დაგვჭირდება Gemini-ს ასინქრონული გამოძახებისთვის
+
+# --- Gemini AI Setup ---
+import google.generativeai as genai
+# -------------------------
 
 from dotenv import load_dotenv
-# განახლებული იმპორტები telegram.ext-დან
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup # Update აქედანაც არის იმპორტირებული
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -15,20 +19,32 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ConversationHandler,
-    CallbackQueryHandler # <-- დაემატა იმპორტი
+    CallbackQueryHandler,
 )
 
-# შესწორებული Kerykeion იმპორტი (try...except-ის გარეშე)
-from kerykeion import AstrologicalSubject
+try:
+    from kerykeion import AstrologicalSubject
+except ImportError:
+    from kerykeion.kerykeion import AstrologicalSubject
 
 # .env ფაილიდან გარემოს ცვლადების ჩატვირთვა
 load_dotenv()
 
 # --- კონფიგურაცია ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Gemini API კლუჩი
 GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME")
 DB_FILE = "user_data.db"
+
+# --- Gemini კონფიგურაცია ---
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger_gemini = logging.getLogger("google.generativeai") # Gemini-ს ლოგერი
+    # შეიძლება დაგვჭირდეს მისი დონის აწევა, თუ ბევრს ლოგავს:
+    # logger_gemini.setLevel(logging.WARNING)
+else:
+    logging.warning("GEMINI_API_KEY not found in environment variables. AI features will be disabled.")
+# -------------------------
 
 # ლოგირების ჩართვა
 logging.basicConfig(
@@ -39,9 +55,8 @@ logging.getLogger("kerykeion").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- მონაცემთა ბაზის ფუნქციები ---
-# (init_db, save_user_data, get_user_data, delete_user_data ფუნქციები უცვლელია)
+# (init_db, save_user_data, get_user_data, delete_user_data - უცვლელია)
 def init_db():
-    """ქმნის მონაცემთა ბაზის ფაილს და ცხრილს, თუ არ არსებობს."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -65,7 +80,6 @@ def init_db():
         logger.error(f"Database initialization error: {e}")
 
 def save_user_data(user_id: int, data: dict):
-    """ინახავს ან ანახლებს მომხმარებლის მონაცემებს ბაზაში."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -87,10 +101,9 @@ def save_user_data(user_id: int, data: dict):
         return False
 
 def get_user_data(user_id: int) -> dict | None:
-    """აბრუნებს მომხმარებლის შენახულ მონაცემებს ბაზიდან, თუ არსებობს."""
     try:
         conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row # შედეგი ლექსიკონის სახით რომ დააბრუნოს
+        conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM user_birth_data WHERE user_id = ?", (user_id,))
         row = cursor.fetchone()
@@ -106,7 +119,6 @@ def get_user_data(user_id: int) -> dict | None:
         return None
 
 def delete_user_data(user_id: int):
-    """შლის მომხმარებლის მონაცემებს ბაზიდან."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
@@ -119,10 +131,36 @@ def delete_user_data(user_id: int):
         logger.error(f"Error deleting data for user {user_id}: {e}")
         return False
 
-# --- დამხმარე ფუნქცია რუკის გენერირებისთვის და გაგზავნისთვის ---
-# (generate_and_send_chart ფუნქცია უცვლელია)
+
+# --- პლანეტების ემოჯები ---
+planet_emojis = {
+    "Sun": "☀️", "Moon": "🌙", "Mercury": "☿️", "Venus": "♀️", "Mars": "♂️",
+    "Jupiter": "♃", "Saturn": "♄", "Uranus": "♅", "Neptune": "♆", "Pluto": "♇",
+    "Chiron": " Chiron ", "Mean_Node": " Node ", # Add more as needed
+}
+
+
+# --- Gemini-სთან კომუნიკაციის ფუნქცია ---
+async def get_gemini_interpretation(prompt: str) -> str:
+    """Calls Gemini API asynchronously to get interpretation."""
+    if not GEMINI_API_KEY:
+        return "(Gemini API კლუჩი არ არის კონფიგურირებული)"
+
+    try:
+        # ვიყენებთ უახლეს Flash მოდელს სიჩქარისთვის/ფასისთვის
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        # ასინქრონული გამოძახება
+        response = await model.generate_content_async(prompt)
+        # ზოგჯერ პასუხი შეიძლება ცარიელი იყოს ან უსაფრთხოების ფილტრებმა დაბლოკოს
+        return response.text.strip() if hasattr(response, 'text') else "(Gemini-მ პასუხი არ დააბრუნა)"
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}", exc_info=True)
+        return "(ინტერპრეტაციის გენერირებისას მოხდა შეცდომა)"
+
+
+# --- რუკის გენერირების და გაგზავნის ფუნქცია (Gemini-ს ინტეგრაციით) ---
 async def generate_and_send_chart(user_data: dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Generates natal chart using Kerykeion and sends the result."""
+    """Generates natal chart using Kerykeion and gets interpretations from Gemini."""
     name = user_data.get('name', 'User')
     year = user_data.get('year')
     month = user_data.get('month')
@@ -136,89 +174,135 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
          await context.bot.send_message(chat_id=chat_id, text="მონაცემები არასრულია რუკის შესადგენად.")
          return
 
-    logger.info(f"Generating chart for: {name}, {day}/{month}/{year} {hour}:{minute}, {city}, {nation}")
-    processing_message = await context.bot.send_message(chat_id=chat_id, text="მონაცემები მიღებულია, ვიწყებ რუკის გამოთვლას...")
+    logger.info(f"Generating Kerykeion data for: {name}, {day}/{month}/{year} {hour}:{minute}, {city}, {nation}")
+    processing_message = await context.bot.send_message(chat_id=chat_id, text="მონაცემები მიღებულია, ვიწყებ ასტროლოგიური მონაცემების გამოთვლას...")
 
     try:
+        # --- Kerykeion-ის გამოთვლა ---
         if not GEONAMES_USERNAME:
             logger.warning("GEONAMES_USERNAME not set. Kerykeion might have issues with city lookup.")
 
+        # ეს ნაწილი ისევ ბლოკირებადია, იდეალურად ცალკე thread-ში უნდა გაეშვას
         subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation)
+        logger.info(f"Kerykeion data generated successfully for {name}.")
 
-        sun_info = subject_instance.sun
-        sun_sign = sun_info['sign']
-        sun_position = f"{sun_info['position']:.2f}°"
+        # --- საბაზისო ინფორმაცია ---
+        base_info_text = (
+            f"✨ {name}-ს ნატალური რუკა ✨\n\n"
+            f"დაბადების მონაცემები: {day}/{month}/{year}, {hour:02d}:{minute:02d}, {city}{f', {nation}' if nation else ''}\n\n"
+        )
+        try:
+            sun_info = subject_instance.sun
+            sun_sign = sun_info['sign']
+            sun_position = f"{sun_info['position']:.2f}°"
+            base_info_text += f"☀️ მზე: {sun_sign} ({sun_position})\n"
+        except Exception: base_info_text += "☀️ მზე: (შეცდომა)\n"
 
         try:
             ascendant_info = subject_instance.first_house
             ascendant_sign = ascendant_info['sign']
             ascendant_position = f"{ascendant_info['position']:.2f}°"
-            asc_text = f"ასცედენტი: {ascendant_sign} {ascendant_position}\n\n"
+            base_info_text += f"⬆️ ასცედენტი: {ascendant_sign} ({ascendant_position})\n"
         except Exception as asc_err:
              logger.warning(f"Could not calculate Ascendant for {name}: {asc_err}")
-             asc_text = "ასცედენტი: (ვერ გამოითვალა - შეამოწმეთ ქალაქი/დრო)\n\n"
-
-        planets_text = "მთავარი პლანეტები:\n"
-        main_planets = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn']
-        for planet_name in main_planets:
-            try:
-                planet_obj = getattr(subject_instance, planet_name.lower())
-                planets_text += f"- {planet_name}: {planet_obj['sign']} ({planet_obj['position']:.2f}°)\n"
-            except Exception as planet_err:
-                logger.error(f"Error getting info for planet {planet_name}: {planet_err}")
-                planets_text += f"- {planet_name}: (შეცდომა)\n"
+             base_info_text += "⬆️ ასცედენტი: (ვერ გამოითვალა - შეამოწმეთ ქალაქი/დრო)\n"
 
         time_note = ""
         if hour == 12 and minute == 0:
-             time_note = "\n(შენიშვნა: დრო მითითებულია 12:00, რადგან ზუსტი დრო უცნობი იყო. ასცედენტი და სახლები შეიძლება არ იყოს ზუსტი.)"
+             time_note = "\n(შენიშვნა: დრო მითითებულია 12:00. ასცედენტი და სახლები შეიძლება არ იყოს ზუსტი.)"
+        base_info_text += time_note + "\n"
 
-        response_text = (
-            f"✨ {name}-ს ნატალური რუკა ✨\n\n"
-            f"დაბადების მონაცემები: {day}/{month}/{year}, {hour:02d}:{minute:02d}, {city}{f', {nation}' if nation else ''}\n\n"
-            f"მზე: {sun_sign} {sun_position}\n"
-            f"{asc_text}"
-            f"{planets_text}"
-            f"{time_note}"
-        )
-        logger.info(f"Chart generated successfully for {name}.")
-        await processing_message.edit_text(text=response_text)
+        # ვაახლებთ შეტყობინებას, ვაჩვენებთ, რომ ვიწყებთ ინტერპრეტაციებს
+        await processing_message.edit_text(text=base_info_text + "\n⏳ ვიწყებ ინტერპრეტაციების გენერირებას Gemini-სთან...")
 
+        # --- ინტერპრეტაციები Gemini-სგან (მხოლოდ პლანეტები ნიშნებში) ---
+        interpretations_text = "\n--- 🪐 პლანეტები ნიშნებში ---\n"
+        # დავამატოთ მთვარეც
+        main_planets_for_interpretation = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn']
+
+        interpretation_tasks = []
+        planet_data_for_formatting = []
+
+        for planet_name in main_planets_for_interpretation:
+            try:
+                planet_obj = getattr(subject_instance, planet_name.lower())
+                sign = planet_obj['sign']
+                pos = planet_obj['position']
+                # ვინახავთ მონაცემებს ფორმატირებისთვის
+                planet_data_for_formatting.append({
+                    "name": planet_name, "sign": sign, "pos": pos
+                })
+                # ვქმნით prompt-ს
+                prompt = (f"შენ ხარ ასტროლოგიის ექსპერტი. დაწერე ძალიან მოკლე (1-2 წინადადება) და პოზიტიური ასტროლოგიური ინტერპრეტაცია "
+                          f"ქართულად იმ ადამიანისთვის, ვისაც {planet_name} ყავს {sign} ნიშანში. "
+                          f"ფოკუსირება გააკეთე მის ძირითად მახასიათებლებზე ან ცხოვრებისეულ თემაზე, რომელიც ამ მდებარეობას უკავშირდება.")
+                # ვამატებთ ასინქრონულ ამოცანას Gemini-ს გამოსაძახებლად
+                interpretation_tasks.append(get_gemini_interpretation(prompt))
+                logger.info(f"Created Gemini task for {planet_name} in {sign}")
+
+            except Exception as planet_err:
+                logger.error(f"Error getting Kerykeion data for planet {planet_name}: {planet_err}")
+                # თუ პლანეტის მონაცემებს ვერ ვიღებთ, ინტერპრეტაციასაც გამოვტოვებთ
+                planet_data_for_formatting.append({
+                     "name": planet_name, "sign": "???", "pos": 0.0, "error": True
+                })
+                interpretation_tasks.append(asyncio.sleep(0, result="(პლანეტის მონაცემები ვერ მოიძებნა)")) # ვამატებთ dummy შედეგს
+
+        # ველოდებით ყველა Gemini-ს პასუხს ერთად
+        logger.info(f"Waiting for {len(interpretation_tasks)} Gemini interpretations...")
+        all_interpretations = await asyncio.gather(*interpretation_tasks)
+        logger.info("All Gemini interpretations received.")
+
+        # ვაწყობთ ტექსტს
+        for i, data in enumerate(planet_data_for_formatting):
+             planet_name = data["name"]
+             sign = data["sign"]
+             pos = data["pos"]
+             interpretation = all_interpretations[i] # ვიღებთ შესაბამის ინტერპრეტაციას
+             emoji = planet_emojis.get(planet_name, "🪐")
+
+             interpretations_text += f"\n{emoji} **{planet_name} {sign}-ში** (`{pos:.2f}°`)\n{interpretation}\n"
+
+
+        # --- საბოლოო პასუხი ---
+        final_response_text = base_info_text + interpretations_text
+        # TODO: დავამატოთ პლანეტები სახლებში და ასპექტების ინტერპრეტაციებიც ანალოგიურად
+
+        # შევამოწმოთ სიგრძე (Telegram-ის ლიმიტია 4096 სიმბოლო)
+        if len(final_response_text) > 4090: # დავუტოვოთ მცირე ზღვარი
+             # ამ ეტაპზე უბრალოდ შევამოკლოთ, მოგვიანებით დავყოთ ნაწილებად
+             final_response_text = final_response_text[:4090] + "..."
+             logger.warning("Response text too long, truncated.")
+
+        # გავაგზავნოთ საბოლოო პასუხი
+        await processing_message.edit_text(text=final_response_text, parse_mode='HTML') # გამოვიყენოთ HTML ფორმატირება
+        logger.info(f"Final chart with interpretations sent for {name}.")
+
+    # --- შეცდომების დაჭერა ---
     except ConnectionError as ce:
         logger.error(f"Kerykeion ConnectionError for {name}: {ce}")
         await processing_message.edit_text(text=f"Kerykeion კავშირის შეცდომა (სავარაუდოდ GeoNames): {ce}. შეამოწმეთ ინტერნეტ კავშირი ან სცადეთ მოგვიანებით.")
     except Exception as e:
+        # დავამატოთ შეცდომის ლოგირება აქაც
         logger.error(f"An unexpected error occurred generating chart for {name}: {e}", exc_info=True)
-        await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
-
-
-# --- Handler ფუნქციები (განსაზღვრული main-ამდე) ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles the /start command."""
-    user = update.effective_user
-    user_data = get_user_data(user.id) # შევამოწმოთ, აქვს თუ არა მონაცემები
-    start_text = rf"გამარჯობა {user.mention_html()}! მე ვარ Subconscious ბოტი."
-    if user_data:
-         start_text += f"\n\nთქვენი შენახული მონაცემებია: {user_data.get('name')}, {user_data.get('day')}/{user_data.get('month')}/{user_data.get('year')}."
-         start_text += "\nგამოიყენეთ /createchart ახალი რუკის შესადგენად (შეგიძლიათ აირჩიოთ შენახული მონაცემების გამოყენება)."
-         start_text += "\n/mydata - შენახული მონაცემების ჩვენება."
-         start_text += "\n/deletedata - შენახული მონაცემების წაშლა."
-    else:
-        start_text += "\n\nნატალური რუკის შესაქმნელად გამოიყენეთ /createchart ბრძანება."
-
-    await update.message.reply_html(start_text)
+        # შევეცადოთ შეცდომის შეტყობინების რედაქტირებას
+        try:
+            await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
+        except Exception: # თუ რედაქტირებაც ვერ ხერხდება
+            # გავაგზავნოთ ახალი შეტყობინება (იშვიათი შემთხვევა)
+             await context.bot.send_message(chat_id=chat_id, text="მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
 
 
 # --- ConversationHandler-ის მდგომარეობები ---
-(NAME, YEAR, MONTH, DAY, HOUR, MINUTE, CITY, NATION, SAVED_DATA_CHOICE) = range(9) # დაემატა SAVED_DATA_CHOICE
+(NAME, YEAR, MONTH, DAY, HOUR, MINUTE, CITY, NATION, SAVED_DATA_CHOICE) = range(9)
 
 # --- ConversationHandler-ის ფუნქციები ---
-
+# (create_chart_start, handle_saved_data_choice, handle_name, handle_year, handle_month, handle_day, handle_hour, handle_minute, handle_city, handle_nation, skip_nation, cancel - უცვლელია)
 async def create_chart_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation or asks about using saved data."""
     user_id = update.effective_user.id
     logger.info(f"User {user_id} started chart creation process with /createchart.")
-    context.user_data.clear() # ვასუფთავებთ წინა დროებით მონაცემებს
+    context.user_data.clear()
 
     saved_data = get_user_data(user_id)
     if saved_data:
@@ -232,7 +316,7 @@ async def create_chart_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "გსურთ ამ მონაცემებით რუკის შედგენა?",
             reply_markup=reply_markup
         )
-        return SAVED_DATA_CHOICE # გადავდივართ ახალ მდგომარეობაში, ველოდებით ღილაკის პასუხს
+        return SAVED_DATA_CHOICE
     else:
         await update.message.reply_text(
             "ნატალური რუკის შესაქმნელად, მჭირდება თქვენი მონაცემები.\n"
@@ -244,7 +328,7 @@ async def create_chart_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_saved_data_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Handles the user's choice regarding saved data via callback query."""
     query = update.callback_query
-    await query.answer() # აუცილებელია callback query-ზე პასუხის გასაცემად
+    await query.answer()
     user_id = query.from_user.id
     choice = query.data
 
@@ -257,7 +341,7 @@ async def handle_saved_data_choice(update: Update, context: ContextTypes.DEFAULT
             return ConversationHandler.END
         else:
             await query.edit_message_text("შენახული მონაცემები ვერ მოიძებნა. ვიწყებ ახლის შეგროვებას.")
-            await query.message.reply_text("გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:") # პირდაპირ ვესაუბრებით ჩატს
+            await query.message.reply_text("გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:")
             return NAME
     elif choice == "enter_new_data":
         await query.edit_message_text("კარგი, შევიყვანოთ ახალი მონაცემები.")
@@ -273,19 +357,16 @@ async def handle_saved_data_choice(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
 
 async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the name input and asks for the year."""
     user_name_input = update.message.text
     if not user_name_input or len(user_name_input) < 2:
          await update.message.reply_text("გთხოვთ, შეიყვანოთ კორექტული სახელი (მინ. 2 სიმბოლო).")
          return NAME
-
     context.user_data['name'] = user_name_input
     logger.info(f"User {update.effective_user.id} entered name: {user_name_input}")
     await update.message.reply_text(f"გმადლობთ, {user_name_input}. ახლა გთხოვთ, შეიყვანოთ დაბადების წელი (მაგ., 1990):")
     return YEAR
 
 async def handle_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the year input and asks for the month."""
     try:
         year = int(update.message.text)
         current_year = datetime.now().year
@@ -302,7 +383,6 @@ async def handle_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return YEAR
 
 async def handle_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the month input and asks for the day."""
     try:
         month = int(update.message.text)
         if 1 <= month <= 12:
@@ -318,10 +398,8 @@ async def handle_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return MONTH
 
 async def handle_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the day input and asks for the hour."""
     try:
         day = int(update.message.text)
-        # TODO: Add validation based on month and leap year later if needed
         if 1 <= day <= 31:
             context.user_data['day'] = day
             logger.info(f"User {update.effective_user.id} entered day: {day}")
@@ -335,7 +413,6 @@ async def handle_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return DAY
 
 async def handle_hour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the hour input and asks for the minute."""
     try:
         hour = int(update.message.text)
         if 0 <= hour <= 23:
@@ -351,7 +428,6 @@ async def handle_hour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return HOUR
 
 async def handle_minute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the minute input and asks for the city."""
     try:
         minute = int(update.message.text)
         if 0 <= minute <= 59:
@@ -367,12 +443,10 @@ async def handle_minute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return MINUTE
 
 async def handle_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handles the city input and asks for the nation (optional)."""
     city = update.message.text
     if not city or len(city) < 2:
          await update.message.reply_text("გთხოვთ, შეიყვანოთ კორექტული ქალაქის სახელი.")
          return CITY
-
     context.user_data['city'] = city.strip()
     logger.info(f"User {update.effective_user.id} entered city: {city.strip()}")
     await update.message.reply_text("შეიყვანეთ ქვეყნის კოდი (სურვილისამებრ, მაგ., GE, US, GB), ან გამოტოვეთ /skip ბრძანებით:")
@@ -384,7 +458,6 @@ async def handle_nation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     user_id = update.effective_user.id
     chat_id = update.message.chat_id
 
-    # ქვეყნის კოდის ვალიდაცია (2 ან 3 ასო)
     if len(nation_input) < 2 or len(nation_input) > 3 or not nation_input.isalpha():
          await update.message.reply_text("არასწორი ქვეყნის კოდის ფორმატი. გთხოვთ, შეიყვანოთ 2 ან 3 ასო (მაგ., GE) ან /skip.")
          return NATION
@@ -430,7 +503,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 # --- სხვა ბრძანებები ---
-
 async def show_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
      """Shows the user their saved birth data."""
      user_id = update.effective_user.id
@@ -441,7 +513,7 @@ async def show_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
          text += f"  თარიღი: {user_data.get('day', '-')}/{user_data.get('month', '-')}/{user_data.get('year', '-')}\n"
          text += f"  დრო: {user_data.get('hour', '-')}:{user_data.get('minute', '-')}\n"
          text += f"  ქალაქი: {user_data.get('city', '-')}\n"
-         text += f"  ქვეყანა: {user_data.get('nation') or 'არ არის მითითებული'}" # None-ის შემთხვევაში გამოიტანს ტექსტს
+         text += f"  ქვეყანა: {user_data.get('nation') or 'არ არის მითითებული'}"
          await update.message.reply_text(text)
      else:
          await update.message.reply_text("თქვენ არ გაქვთ შენახული მონაცემები. გამოიყენეთ /createchart დასამატებლად.")
@@ -456,24 +528,26 @@ async def delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --- მთავარი ფუნქცია ---
-
 def main() -> None:
     """Start the bot in polling mode."""
-    # შევქმნათ/შევამოწმოთ მონაცემთა ბაზა გაშვებისას
     init_db()
 
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("Error: TELEGRAM_BOT_TOKEN environment variable not set. Bot cannot start.")
         return
+    # Gemini კლუჩის შემოწმება გაშვებისას
+    if not GEMINI_API_KEY:
+         logger.warning("Warning: GEMINI_API_KEY environment variable not set. AI features will be disabled.")
+
 
     logger.info("Creating application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # --- Conversation Handler-ის შექმნა ---
+    # Conversation Handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('createchart', create_chart_start)],
         states={
-            SAVED_DATA_CHOICE: [ # ახალი მდგომარეობა ღილაკზე პასუხისთვის
+            SAVED_DATA_CHOICE: [
                  CallbackQueryHandler(handle_saved_data_choice, pattern='^(use_saved_data|enter_new_data|cancel_creation)$')
             ],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
@@ -485,24 +559,25 @@ def main() -> None:
             CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city)],
             NATION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nation),
-                CommandHandler('skip', skip_nation) # /skip ბრძანება ქვეყნის გამოსატოვებლად
+                CommandHandler('skip', skip_nation)
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel)],
+        # persistent=True, name="chart_creation_conversation" # მდგომარეობის შენახვა ბოტის რესტარტისას (მოითხოვს PicklePersistence) - მოგვიანებით დავამატოთ
+        # allow_reentry=True
     )
 
     # Handler-ების რეგისტრაცია
-    application.add_handler(conv_handler) # <-- ვამატებთ ConversationHandler-ს
-    application.add_handler(CommandHandler("start", start)) # /start ისევ გვჭირდება მისასალმებლად
-    application.add_handler(CommandHandler("mydata", show_my_data)) # ახალი ბრძანება მონაცემების სანახავად
-    application.add_handler(CommandHandler("deletedata", delete_data)) # ახალი ბრძანება მონაცემების წასაშლელად
+    application.add_handler(conv_handler)
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("mydata", show_my_data))
+    application.add_handler(CommandHandler("deletedata", delete_data))
 
     logger.info("Handlers registered (Conversation, start, mydata, deletedata).")
 
     # ბოტის გაშვება POLLING რეჟიმში
     logger.info("Starting bot polling...")
-    # ვიყენებთ Update.ALL_TYPES, რათა CallbackQueryHandler-მა იმუშაოს
-    application.run_polling(allowed_updates=Update.ALL_TYPES) # <-- შესწორებულია TelegramUpdate -> Update
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 # --- სკრიპტის გაშვების წერტილი ---
 if __name__ == "__main__":
