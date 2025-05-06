@@ -157,7 +157,11 @@ translations = {
         "gemini_section_aspects_start": "[SECTION: AspectsStart]",
         "gemini_aspects_instruction": "(ასპექტები. თითოეულისთვის ანალიზი.)",
         "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
-        "gemini_final_instruction": "დაწერე მხოლოდ სექციების ტექსტი, შესავლის/დასკვნის გარეშე."
+        "gemini_final_instruction": "დაწერე მხოლოდ სექციების ტექსტი, შესავლის/დასკვნის გარეშე.",
+        "section_title_pis": "პლანეტები ნიშნებში",
+        "section_title_pih": "პლანეტები სახლებში",
+        "section_title_aspects": "ასპექტები",
+        "time_note_12_00": "შენიშვნა: გამოყენებულია ნაგულისხმევი დრო 12:00, რადგან ზუსტი დრო უცნობია."
     },
     "en": {
         "language_chosen": "You have selected English.",
@@ -243,7 +247,11 @@ translations = {
         "gemini_section_aspects_start": "[SECTION: AspectsStart]",
         "gemini_aspects_instruction": "(Aspects. Analyze each.)",
         "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
-        "gemini_final_instruction": "Return only section texts, no intro/conclusion."
+        "gemini_final_instruction": "Return only section texts, no intro/conclusion.",
+        "section_title_pis": "Planets in Signs",
+        "section_title_pih": "Planets in Houses",
+        "section_title_aspects": "Aspects",
+        "time_note_12_00": "Note: Default time 12:00 used as exact time is unknown."
     },
     "ru": {
         "language_chosen": "Вы выбрали русский язык.",
@@ -329,7 +337,11 @@ translations = {
         "gemini_section_aspects_start": "[SECTION: AspectsStart]",
         "gemini_aspects_instruction": "(Аспекты. Анализ для каждого.)",
         "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
-        "gemini_final_instruction": "Верните только текст секций."
+        "gemini_final_instruction": "Верните только текст секций.",
+        "section_title_pis": "Планеты в Знаках",
+        "section_title_pih": "Планеты в Домах",
+        "section_title_aspects": "Аспекты",
+        "time_note_12_00": "Примечание: Использовано время 12:00, так как точное время неизвестно."
     }
 }
 DEFAULT_LANGUAGE = "ka"
@@ -496,7 +508,7 @@ async def generate_and_send_chart(user_id: int, chat_id: int, context: ContextTy
 
     if not current_user_data:
         await context.bot.send_message(chat_id=chat_id, text=get_text("no_data_found", lang_code))
-        return
+        return ConversationHandler.END
 
     name = current_user_data.get('name', 'User')
     year = current_user_data.get('year')
@@ -509,9 +521,569 @@ async def generate_and_send_chart(user_id: int, chat_id: int, context: ContextTy
 
     if not all([name, year, month, day, isinstance(hour, int), isinstance(minute, int), city]):
         await context.bot.send_message(chat_id=chat_id, text="მონაცემები არასრულია.")
-        return
+        return ConversationHandler.END
 
     if not is_new_data and current_user_data.get('full_chart_text'):
+        logger.info(f"Displaying saved chart for user {user_id}")
         parts = split_text(current_user_data['full_chart_text'])
         for part in parts:
-            await context.bot.send_message(chat_id=chat_id, text=part, parse TRIGGER_WARNING: You have reached the context length limit. The conversation will now be reset. Please provide any additional information or ask a new question to continue.
+            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
+        await context.bot.send_message(chat_id=chat_id, text=get_text("main_menu_text", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+        return ConversationHandler.END
+
+    logger.info(f"Generating Kerykeion data for: {name}, {day}/{month}/{year} {hour}:{minute}, {city}, {nation}")
+    processing_message = await context.bot.send_message(chat_id=chat_id, text=get_text("processing_kerykeion", lang_code))
+
+    try:
+        if not GEONAMES_USERNAME:
+            logger.warning("GEONAMES_USERNAME not set.")
+            await context.bot.send_message(chat_id=chat_id, text=get_text("geonames_warning_user", lang_code))
+
+        subject_instance = await asyncio.to_thread(
+            AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME
+        )
+        logger.info(f"Kerykeion data generated for {name}.")
+
+        aspects_data_str_for_prompt = ""
+        try:
+            aspect_calculator = NatalAspects(
+                subject_instance,
+                aspects_list=MAJOR_ASPECTS_TYPES,
+                planets_to_consider=ASPECT_PLANETS,
+                orb_dictionary=ASPECT_ORBS
+            )
+            all_filtered_aspects = aspect_calculator.get_relevant_aspects()
+            if all_filtered_aspects:
+                for aspect in all_filtered_aspects:
+                    p1 = aspect.get('p1_name')
+                    p2 = aspect.get('p2_name')
+                    aspect_type = aspect.get('aspect')
+                    orb = aspect.get('orbit', 0.0)
+                    if p1 and p2 and aspect_type:
+                        aspect_name_ge = aspect_translations.get(aspect_type, aspect_type)
+                        aspect_symbol_char = aspect_symbols.get(aspect_type, "")
+                        p1_emoji = planet_emojis.get(p1, "")
+                        p2_emoji = planet_emojis.get(p2, "")
+                        aspects_data_str_for_prompt += f"- {p1_emoji}{p1} {aspect_symbol_char} {p2_emoji}{p2} ({aspect_name_ge}, ორბისი {orb:.1f}°)\n"
+            if not aspects_data_str_for_prompt:
+                aspects_data_str_for_prompt = "- მნიშვნელოვანი ასპექტები ვერ მოიძებნა.\n"
+        except Exception as aspect_err:
+            logger.error(f"Aspect calculation error: {aspect_err}", exc_info=True)
+            aspects_data_str_for_prompt = "- ასპექტების გამოთვლის შეცდომა.\n"
+            await context.bot.send_message(chat_id=chat_id, text=get_text("aspect_calculation_error_user", lang_code))
+
+        planets_data_str_for_prompt = ""
+        planet_list_for_prompt = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven']
+        for planet_name in planet_list_for_prompt:
+            try:
+                obj_name_in_kerykeion = planet_name.lower()
+                if planet_name == "Midheaven": obj_name_in_kerykeion = "mc"
+                elif planet_name == "Ascendant": obj_name_in_kerykeion = "ascendant"
+                planet_obj = getattr(subject_instance, obj_name_in_kerykeion)
+                sign = planet_obj.get('sign', '?')
+                pos = planet_obj.get('position', 0.0)
+                house_val = planet_obj.get('house')
+                house_str = f", {house_val}-ე სახლი" if isinstance(house_val, int) else ""
+                retro = " (R)" if planet_obj.get('isRetro') == 'true' else ""
+                planets_data_str_for_prompt += f"- {planet_name}: {sign} {pos:.2f}°{house_str}{retro}\n"
+            except AttributeError:
+                if planet_name == "Ascendant": planet_obj = getattr(subject_instance, "first_house", None)
+                elif planet_name == "Midheaven": planet_obj = getattr(subject_instance, "tenth_house", None)
+                else: planet_obj = None
+                if planet_obj:
+                    sign = planet_obj.get('sign', '?')
+                    pos = planet_obj.get('position', 0.0)
+                    planets_data_str_for_prompt += f"- {planet_name}: {sign} {pos:.2f}°\n"
+                else:
+                    logger.error(f"Error getting data for {planet_name}")
+                    planets_data_str_for_prompt += f"- {planet_name}: მონაცემების შეცდომა\n"
+            except Exception as e:
+                logger.error(f"Error getting data for {planet_name}: {e}")
+                planets_data_str_for_prompt += f"- {planet_name}: სრული მონაცემების შეცდომა\n"
+
+        gemini_lang_name = "ქართულ" if lang_code == "ka" else "ინგლისურ" if lang_code == "en" else "რუსულ"
+        large_prompt = (
+            get_text("gemini_main_prompt_intro", lang_code).format(language=gemini_lang_name) + "\n" +
+            get_text("gemini_main_prompt_instruction_1", lang_code).format(name=name) + "\n" +
+            get_text("gemini_main_prompt_instruction_2", lang_code) + "\n" +
+            get_text("gemini_main_prompt_instruction_3", lang_code) + "\n\n" +
+            get_text("gemini_data_header", lang_code) + "\n" +
+            get_text("gemini_name", lang_code).format(name=name) + "\n" +
+            get_text("gemini_birth_date_time", lang_code).format(day=day, month=month, year=year, hour=hour, minute=minute) + "\n" +
+            get_text("gemini_birth_location", lang_code).format(city=city, location_nation_suffix=(f', {nation}' if nation else '')) + "\n" +
+            get_text("gemini_systems_used", lang_code) + "\n\n" +
+            get_text("gemini_planet_positions_header", lang_code) + "\n" +
+            planets_data_str_for_prompt + "\n" +
+            get_text("gemini_aspects_header", lang_code) + "\n" +
+            aspects_data_str_for_prompt + "\n" +
+            get_text("gemini_task_header", lang_code) + "\n" +
+            get_text("gemini_task_instruction_1", lang_code) + "\n" +
+            get_text("gemini_section_pis_start", lang_code) + "\n" +
+            get_text("gemini_pis_instruction", lang_code) + "\n" +
+            get_text("gemini_section_pis_end", lang_code) + "\n\n" +
+            get_text("gemini_section_pih_start", lang_code) + "\n" +
+            get_text("gemini_pih_instruction", lang_code) + "\n" +
+            get_text("gemini_section_pih_end", lang_code) + "\n\n" +
+            get_text("gemini_section_aspects_start", lang_code) + "\n" +
+            get_text("gemini_aspects_instruction", lang_code) + "\n" +
+            get_text("gemini_section_aspects_end", lang_code) + "\n\n" +
+            get_text("gemini_final_instruction", lang_code)
+        )
+
+        await processing_message.edit_text(text=get_text("gemini_prompt_start", lang_code), parse_mode=ParseMode.HTML)
+        full_interpretation_text = await get_gemini_interpretation(large_prompt)
+        logger.info(f"Received interpretation for user {chat_id}. Length: {len(full_interpretation_text)}")
+
+        save_user_data(user_id, current_user_data, chart_text=full_interpretation_text)
+        current_user_data['full_chart_text'] = full_interpretation_text
+
+        final_report_parts = []
+        base_info_text = (
+            f"✨ {name}-ს ნატალური რუკა ✨\n\n"
+            f"<b>დაბადების მონაცემები:</b> {day}/{month}/{year}, {hour:02d}:{minute:02d}, {city}{f', {nation}' if nation else ''}\n"
+            f"<b>{get_text('gemini_systems_used', lang_code)}</b>\n\n"
+        )
+        try:
+            sun_info = subject_instance.sun
+            base_info_text += f"{planet_emojis.get('Sun')} <b>მზე:</b> {sun_info['sign']} (<code>{sun_info['position']:.2f}°</code>)\n"
+        except:
+            pass
+        try:
+            asc_info = subject_instance.ascendant
+            base_info_text += f"{planet_emojis.get('Ascendant')} <b>ასცედენტი:</b> {asc_info['sign']} (<code>{asc_info['position']:.2f}°</code>)\n"
+        except:
+            pass
+        time_note = f"\n<i>{get_text('time_note_12_00', lang_code)}</i>" if hour == 12 and minute == 0 else ""
+        base_info_text += time_note + "\n"
+        final_report_parts.append(base_info_text)
+
+        pis_text = re.search(r"\[SECTION:\s*PlanetsInSignsStart\](.*?)\[SECTION:\s*PlanetsInSignsEnd\]", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+        pih_text = re.search(r"\[SECTION:\s*PlanetsInHousesStart\](.*?)\[SECTION:\s*PlanetsInHousesEnd\]", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+        asp_text_match = re.search(r"\[SECTION:\s*AspectsStart\](.*?)\[SECTION:\s*AspectsEnd\]", full_interpretation_text, re.DOTALL | re.IGNORECASE)
+
+        if pis_text and pis_text.group(1).strip():
+            final_report_parts.append(f"\n--- 🪐 <b>{get_text('section_title_pis', lang_code)}</b> ---\n\n{pis_text.group(1).strip()}")
+        if pih_text and pih_text.group(1).strip():
+            final_report_parts.append(f"\n--- 🏠 <b>{get_text('section_title_pih', lang_code)}</b> ---\n\n{pih_text.group(1).strip()}")
+        if asp_text_match and asp_text_match.group(1).strip():
+            final_report_parts.append(f"\n--- ✨ <b>{get_text('section_title_aspects', lang_code)}</b> ---\n\n{asp_text_match.group(1).strip()}")
+
+        if len(final_report_parts) == 1 and full_interpretation_text.startswith("("):
+            final_report_parts.append(f"\n<b>ინტერპრეტაცია ვერ მოხერხდა:</b>\n{full_interpretation_text}")
+
+        full_response_text = "".join(final_report_parts).strip()
+        if not full_response_text or full_response_text == base_info_text.strip():
+            await processing_message.edit_text(text=get_text("gemini_interpretation_failed", lang_code))
+            return ConversationHandler.END
+
+        parts = split_text(full_response_text)
+        await processing_message.edit_text(text=parts[0], parse_mode=ParseMode.HTML)
+        for part in parts[1:]:
+            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
+
+    except KerykeionException as ke:
+        logger.error(f"KerykeionException: {ke}", exc_info=False)
+        await processing_message.edit_text(text=get_text("kerykeion_city_error", lang_code).format(city=city))
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        await processing_message.edit_text(text=get_text("chart_error_generic", lang_code))
+        return ConversationHandler.END
+
+    await context.bot.send_message(chat_id=chat_id, text=get_text("chart_ready_menu_prompt", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+    return ConversationHandler.END
+
+# --- ConversationHandler-ის მდგომარეობები ---
+(LANG_CHOICE, SAVED_DATA_OR_NAME, NAME_CONV, BIRTH_DATE_CONV, BIRTH_TIME_CONV, COUNTRY_CONV, CITY_CONV) = range(7)
+
+# --- Handler ფუნქციები ---
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    context.user_data['lang_code'] = lang_code
+
+    user_data = get_user_data(user_id)
+    if user_data:
+        reply_text = (
+            get_text("welcome_existing_user_1", lang_code) + "\n" +
+            get_text("welcome_existing_user_2", lang_code)
+        )
+        keyboard = [
+            [InlineKeyboardButton(get_text("create_chart_button_text", lang_code), callback_data='initiate_chart_creation')]
+        ]
+    else:
+        reply_text = get_text("welcome_new_user", lang_code)
+        keyboard = [
+            [InlineKeyboardButton(get_text("create_chart_button_text", lang_code), callback_data='initiate_chart_creation')]
+        ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(reply_text, reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+    return LANG_CHOICE
+
+async def handle_language_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lang_code = query.data.split('_')[1]
+    context.user_data['lang_code'] = lang_code
+
+    await query.edit_message_text(text=get_text("language_chosen", lang_code))
+    user_data = get_user_data(update.effective_user.id)
+    if user_data:
+        keyboard = [
+            [InlineKeyboardButton(get_text("use_saved_chart_button", lang_code), callback_data='use_saved_chart_conv')],
+            [InlineKeyboardButton(get_text("enter_new_data_button", lang_code), callback_data='enter_new_data_conv')],
+            [InlineKeyboardButton(get_text("cancel_creation_button", lang_code), callback_data='cancel_creation_conv')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.reply_text(
+            get_text("saved_data_exists_1", lang_code).format(
+                name=user_data['name'], day=user_data['day'], month=user_data['month'], year=user_data['year']
+            ) + "\n" + get_text("saved_data_exists_2", lang_code),
+            reply_markup=reply_markup
+        )
+        return SAVED_DATA_OR_NAME
+    else:
+        await query.message.reply_text(
+            get_text("chart_creation_prompt", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        await query.message.reply_text(get_text("ask_name", lang_code))
+        return NAME_CONV
+
+async def initiate_chart_creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_data = get_user_data(update.effective_user.id)
+
+    if user_data:
+        keyboard = [
+            [InlineKeyboardButton(get_text("use_saved_chart_button", lang_code), callback_data='use_saved_chart_conv')],
+            [InlineKeyboardButton(get_text("enter_new_data_button", lang_code), callback_data='enter_new_data_conv')],
+            [InlineKeyboardButton(get_text("cancel_creation_button", lang_code), callback_data='cancel_creation_conv')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            get_text("saved_data_exists_1", lang_code).format(
+                name=user_data['name'], day=user_data['day'], month=user_data['month'], year=user_data['year']
+            ) + "\n" + get_text("saved_data_exists_2", lang_code),
+            reply_markup=reply_markup
+        )
+        return SAVED_DATA_OR_NAME
+    else:
+        await query.edit_message_text(text=get_text("chart_creation_prompt", lang_code))
+        await query.message.reply_text(
+            get_text("ask_name", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return NAME_CONV
+
+async def create_chart_start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_data = get_user_data(user_id)
+
+    if user_data:
+        keyboard = [
+            [InlineKeyboardButton(get_text("use_saved_chart_button", lang_code), callback_data='use_saved_chart_conv')],
+            [InlineKeyboardButton(get_text("enter_new_data_button", lang_code), callback_data='enter_new_data_conv')],
+            [InlineKeyboardButton(get_text("cancel_creation_button", lang_code), callback_data='cancel_creation_conv')]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            get_text("saved_data_exists_1", lang_code).format(
+                name=user_data['name'], day=user_data['day'], month=user_data['month'], year=user_data['year']
+            ) + "\n" + get_text("saved_data_exists_2", lang_code),
+            reply_markup=reply_markup
+        )
+        return SAVED_DATA_OR_NAME
+    else:
+        await update.message.reply_text(
+            get_text("chart_creation_prompt", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        await update.message.reply_text(get_text("ask_name", lang_code))
+        return NAME_CONV
+
+async def handle_saved_data_choice_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    if query.data == 'use_saved_chart_conv':
+        await query.edit_message_text(text=get_text("using_saved_chart", lang_code))
+        await generate_and_send_chart(user_id, chat_id, context)
+        return ConversationHandler.END
+    elif query.data == 'enter_new_data_conv':
+        await query.edit_message_text(text=get_text("chart_creation_prompt", lang_code))
+        await query.message.reply_text(
+            get_text("ask_name", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return NAME_CONV
+    else:
+        await query.edit_message_text(text=get_text("chart_generation_cancelled", lang_code))
+        await query.message.reply_text(
+            get_text("main_menu_text", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+        return ConversationHandler.END
+
+async def handle_name_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text(
+            get_text("invalid_name", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return NAME_CONV
+    context.user_data['chart_data'] = {'name': name, 'lang_code': lang_code}
+    await update.message.reply_text(
+        get_text("name_thanks", lang_code).format(name=name),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+    )
+    return BIRTH_DATE_CONV
+
+async def handle_birth_date_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    text = update.message.text.strip()
+    try:
+        year, month, day = map(int, text.split('/'))
+        if not (1900 <= year <= 2025):
+            await update.message.reply_text(
+                get_text("invalid_year_range", lang_code).format(start_year=1900, end_year=2025),
+                reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+            )
+            return BIRTH_DATE_CONV
+        context.user_data['chart_data'].update({'year': year, 'month': month, 'day': day})
+        keyboard = [[KeyboardButton(get_text("time_unknown_button", lang_code))], [KeyboardButton(get_text("cancel_button_text", lang_code))]]
+        await update.message.reply_text(
+            get_text("ask_time", lang_code),
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+        return BIRTH_TIME_CONV
+    except ValueError:
+        await update.message.reply_text(
+            get_text("invalid_date_format", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return BIRTH_DATE_CONV
+
+async def handle_birth_time_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    text = update.message.text.strip()
+    if text == get_text("time_unknown_button", lang_code):
+        hour, minute = 12, 0
+    else:
+        try:
+            hour, minute = map(int, text.split(':'))
+            if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                get_text("invalid_time_format", lang_code),
+                reply_markup=ReplyKeyboardMarkup([
+                    [KeyboardButton(get_text("time_unknown_button", lang_code))],
+                    [KeyboardButton(get_text("cancel_button_text", lang_code))]
+                ], resize_keyboard=True)
+            )
+            return BIRTH_TIME_CONV
+    context.user_data['chart_data'].update({'hour': hour, 'minute': minute})
+    await update.message.reply_text(
+        get_text("ask_country", lang_code),
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+    )
+    return COUNTRY_CONV
+
+async def handle_country_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    country = update.message.text.strip()
+    if len(country) < 2:
+        await update.message.reply_text(
+            get_text("invalid_country", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return COUNTRY_CONV
+    context.user_data['chart_data']['nation'] = country
+    await update.message.reply_text(
+        get_text("ask_city", lang_code).format(country=country),
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+    )
+    return CITY_CONV
+
+async def handle_city_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    city = update.message.text.strip()
+    if len(city) < 2:
+        await update.message.reply_text(
+            get_text("invalid_city", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+        )
+        return CITY_CONV
+    context.user_data['chart_data']['city'] = city
+    await update.message.reply_text(get_text("data_collection_complete", lang_code))
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    await generate_and_send_chart(user_id, chat_id, context, is_new_data=True, data_to_process=context.user_data['chart_data'])
+    return ConversationHandler.END
+
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    await update.message.reply_text(
+        get_text("chart_generation_cancelled", lang_code),
+        reply_markup=get_main_menu_keyboard(lang_code)
+    )
+    return ConversationHandler.END
+
+async def my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text(
+            get_text("no_data_found", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+        return
+    reply_text = (
+        get_text("my_data_header", lang_code) +
+        get_text("my_data_name", lang_code).format(name=user_data['name']) +
+        get_text("my_data_date", lang_code).format(day=user_data['day'], month=user_data['month'], year=user_data['year']) +
+        get_text("my_data_time", lang_code).format(hour=user_data['hour'], minute=user_data['minute']) +
+        get_text("my_data_city", lang_code).format(city=user_data['city']) +
+        get_text("my_data_country", lang_code).format(nation_or_text=user_data['nation'] or get_text("not_specified", lang_code))
+    )
+    await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML, reply_markup=get_main_menu_keyboard(lang_code))
+
+async def view_my_chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_data = get_user_data(user_id)
+    if not user_data:
+        await update.message.reply_text(
+            get_text("no_data_found", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+        return
+    await update.message.reply_text(get_text("using_saved_chart", lang_code))
+    await generate_and_send_chart(user_id, chat_id, context)
+
+async def delete_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    if delete_user_data(user_id):
+        await update.message.reply_text(
+            get_text("data_deleted_success", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+    else:
+        await update.message.reply_text(
+            get_text("data_delete_error", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+
+async def handle_other_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    user_message = update.message.text
+    feature_name = user_message
+    await update.message.reply_text(
+        get_text("feature_coming_soon", lang_code).format(feature_name=feature_name),
+        reply_markup=get_main_menu_keyboard(lang_code)
+    )
+
+async def ask_for_name_direct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    await query.edit_message_text(text=get_text("chart_creation_prompt", lang_code))
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=get_text("ask_name", lang_code),
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+    )
+    return NAME_CONV
+
+async def prompt_for_name_after_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    await update.message.reply_text(
+        get_text("ask_name", lang_code),
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True)
+    )
+    return NAME_CONV
+
+# --- მთავარი ფუნქცია ---
+def main() -> None:
+    init_db()
+    if not TELEGRAM_BOT_TOKEN:
+        logger.critical("TELEGRAM_BOT_TOKEN not set.")
+        return
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
+    main_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start_command)],
+        states={
+            LANG_CHOICE: [
+                CallbackQueryHandler(handle_language_choice, pattern='^lang_(ka|en|ru)$'),
+                CallbackQueryHandler(initiate_chart_creation_callback, pattern='^initiate_chart_creation$')
+            ],
+            SAVED_DATA_OR_NAME: [
+                CallbackQueryHandler(handle_saved_data_choice_conv, pattern='^(use_saved_chart_conv|enter_new_data_conv|cancel_creation_conv)$'),
+                CallbackQueryHandler(ask_for_name_direct, pattern='^initiate_chart_creation_direct$'),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_for_name_after_lang)
+            ],
+            NAME_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_conv)],
+            BIRTH_DATE_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_birth_date_conv)],
+            BIRTH_TIME_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_birth_time_conv)],
+            COUNTRY_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country_conv)],
+            CITY_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city_conv)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel_conv)],
+        allow_reentry=True
+    )
+
+    application.add_handler(main_conv_handler)
+    application.add_handler(CommandHandler("createchart", create_chart_start_conv))
+    application.add_handler(CommandHandler("mydata", my_data_command))
+    application.add_handler(CommandHandler("deletedata", delete_data_command))
+
+    main_menu_buttons_regex_parts = []
+    for lang_code_iter in ["ka", "en", "ru"]:
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_view_chart", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_delete_data", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_dream", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_horoscope", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_palmistry", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_coffee", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("main_menu_button_help", lang_code_iter)))
+        main_menu_buttons_regex_parts.append(re.escape(get_text("create_chart_button_text", lang_code_iter)))
+
+    unique_button_texts = set(main_menu_buttons_regex_parts)
+    combined_regex = '^(' + '|'.join(unique_button_texts) + ')$'
+
+    async def general_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_message = update.message.text
+        lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+        if user_message == get_text("main_menu_button_view_chart", lang_code):
+            await view_my_chart_command(update, context)
+        elif user_message == get_text("main_menu_button_delete_data", lang_code):
+            await delete_data_command(update, context)
+        elif user_message == get_text("create_chart_button_text", lang_code):
+            await create_chart_start_conv(update, context)
+        else:
+            await handle_other_menu_buttons(update, context)
+
+    application.add_handler(MessageHandler(filters.Regex(combined_regex) & filters.TEXT & ~filters.COMMAND, general_menu_handler))
+
+    logger.info("Starting bot...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    load_dotenv()
+    main()
