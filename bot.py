@@ -3,19 +3,16 @@ import os
 import json
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from pathlib import Path
 import asyncio
 import re
 
-# --- Gemini AI Setup ---
 import google.generativeai as genai
 from google.generativeai.types import generation_types
 
-# -------------------------
-
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -30,630 +27,568 @@ from telegram.ext import (
 from kerykeion import AstrologicalSubject, NatalAspects
 from kerykeion.kr_types import KerykeionException
 
-# .env ფაილიდან გარემოს ცვლადების ჩატვირთვა
 load_dotenv()
 
 # --- კონფიგურაცია ---
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME") # !!! ეს უნდა იყოს სწორად .env ფაილში PythonAnywhere-ზე !!!
+GEONAMES_USERNAME = os.getenv("GEONAMES_USERNAME")
 DB_FILE = "user_data.db"
 TELEGRAM_MESSAGE_LIMIT = 4096
+DEFAULT_UNKNOWN_TIME = dt_time(12, 0)
 
 ASPECT_PLANETS = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven']
-MAJOR_ASPECTS_TYPES = ['conjunction', 'opposition', 'square', 'trine', 'sextile'] # ასპექტების ტიპები Kerykeion-ისთვის
+MAJOR_ASPECTS_TYPES = ['conjunction', 'opposition', 'square', 'trine', 'sextile']
 ASPECT_ORBS = {'Sun': 8, 'Moon': 8, 'Ascendant': 5, 'Midheaven': 5, 'default': 6}
 
-# --- Gemini კონფიგურაცია ---
-gemini_model = None
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    safety_settings = [
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}, # BLOCK_MEDIUM_AND_ABOVE
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-    ]
-    try:
-        gemini_model = genai.GenerativeModel(
-            'gemini-1.5-flash-latest',
-            safety_settings=safety_settings
-        )
-        logging.info("Gemini model loaded successfully.")
-    except Exception as e:
-         logging.error(f"Failed to load Gemini model: {e}", exc_info=True)
-else:
-    logging.warning("GEMINI_API_KEY not found in environment variables. AI features will be disabled.")
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("kerykeion").setLevel(logging.INFO) # Kerykeion-ის ლოგირება INFO-ზე, რომ ვნახოთ GeoNames პრობლემები
-logging.getLogger("google.generativeai").setLevel(logging.WARNING)
-logger = logging.getLogger(__name__)
-
-# --- მონაცემთა ბაზის ფუნქციები ---
-# (init_db, save_user_data, get_user_data, delete_user_data - უცვლელია)
-def init_db():
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_birth_data (
-                user_id INTEGER PRIMARY KEY,
-                name TEXT,
-                year INTEGER,
-                month INTEGER,
-                day INTEGER,
-                hour INTEGER,
-                minute INTEGER,
-                city TEXT,
-                nation TEXT
-            )
-        """)
-        conn.commit()
-        conn.close()
-        logger.info(f"Database {DB_FILE} initialized successfully.")
-    except sqlite3.Error as e:
-        logger.error(f"Database initialization error: {e}")
-
-def save_user_data(user_id: int, data: dict):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT OR REPLACE INTO user_birth_data
-            (user_id, name, year, month, day, hour, minute, city, nation)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            user_id,
-            data.get('name'), data.get('year'), data.get('month'), data.get('day'),
-            data.get('hour'), data.get('minute'), data.get('city'), data.get('nation')
-        ))
-        conn.commit()
-        conn.close()
-        logger.info(f"Data saved for user {user_id}")
-        return True
-    except sqlite3.Error as e:
-        logger.error(f"Error saving data for user {user_id}: {e}")
-        return False
-
-def get_user_data(user_id: int) -> dict | None:
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM user_birth_data WHERE user_id = ?", (user_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            logger.info(f"Data retrieved for user {user_id}")
-            return dict(row)
-        else:
-            logger.info(f"No data found for user {user_id}")
-            return None
-    except sqlite3.Error as e:
-        logger.error(f"Error retrieving data for user {user_id}: {e}")
-        return None
-
-def delete_user_data(user_id: int):
-    try:
-        conn = sqlite3.connect(DB_FILE)
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM user_birth_data WHERE user_id = ?", (user_id,))
-        conn.commit()
-        conn.close()
-        logger.info(f"Data deleted for user {user_id}")
-        return True
-    except sqlite3.Error as e:
-        logger.error(f"Error deleting data for user {user_id}: {e}")
-        return False
-
-# --- პლანეტების და ასპექტების ემოჯები/თარგმანები ---
-planet_emojis = {
-    "Sun": "☀️", "Moon": "🌙", "Mercury": "☿️", "Venus": "♀️", "Mars": "♂️",
-    "Jupiter": "♃", "Saturn": "♄", "Uranus": "♅", "Neptune": "♆", "Pluto": "♇",
-    "Ascendant": "⬆️", "Midheaven": " Mᶜ",
+# --- თარგმანები ---
+translations = {
+    "ka": {
+        "language_chosen": "თქვენ აირჩიეთ ქართული ენა.",
+        "welcome_new_user": "პირველ რიგში უნდა შევადგინოთ თქვენი ნატალური რუკა, რათა ჩვენი მიმოწერა უფრო პერსონალური და ზუსტი გახდეს.",
+        "create_chart_button_text": "📜 რუკის შედგენა",
+        "welcome_existing_user_1": "თქვენი შენახული მონაცემებია:",
+        "welcome_existing_user_2": "გამოიყენეთ /createchart ახალი რუკის შესადგენად (შეგიძლიათ აირჩიოთ შენახული მონაცემების გამოყენება).",
+        "menu_mydata": "/mydata - შენახული მონაცემების ჩვენება.",
+        "menu_deletedata": "/deletedata - შენახული მონაცემების წაშლა.",
+        "start_createchart_no_data": "ნატალური რუკის შესაქმნელად გამოიყენეთ /createchart ბრძანება.",
+        "chart_creation_prompt": "ნატალური რუკის შესაქმნელად, მჭირდება თქვენი მონაცემები.\nშეგიძლიათ ნებისმიერ დროს შეწყვიტოთ პროცესი /cancel ბრძანებით.",
+        "ask_name": "გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:",
+        "name_thanks": "გმადლობთ, {name}.\nახლა გთხოვთ, შეიყვანოთ დაბადების სრული თარიღი ფორმატით: <b>წწწწ/თთ/დდ</b> (მაგალითად, <code>1989/11/29</code>):",
+        "invalid_name": "სახელი უნდა შეიცავდეს მინიმუმ 2 სიმბოლოს. სცადეთ თავიდან:",
+        "invalid_date_format": "თარიღის ფორმატი არასწორია. გთხოვთ, შეიყვანოთ <b>წწწწ/თთ/დდ</b> ფორმატით (მაგ., <code>1989/11/29</code>):",
+        "invalid_year_range": "წელი უნდა იყოს {start_year}-სა და {end_year}-ს შორის. გთხოვთ, შეიყვანოთ თარიღი სწორი ფორმატით <b>წწწწ/თთ/დდ</b>:",
+        "ask_time": "გმადლობთ. ახლა გთხოვთ, შეიყვანოთ დაბადების დრო ფორმატით <b>სს:წწ</b> (მაგალითად, <code>15:30</code>), ან დააჭირეთ 'დრო უცნობია' ღილაკს.",
+        "time_unknown_button": "დრო უცნობია (12:00)",
+        "invalid_time_format": "დროის ფორმატი არასწორია. გთხოვთ, შეიყვანოთ <b>სს:წწ</b> ფორმატით (მაგ., <code>15:30</code>) ან დააჭირეთ 'დრო უცნობია'.",
+        "ask_country": "შეიყვანეთ დაბადების ქვეყანა (მაგ., საქართველო, Germany):",
+        "invalid_country": "გთხოვთ, შეიყვანოთ კორექტული ქვეყნის სახელი.",
+        "ask_city": "შეიყვანეთ დაბადების ქალაქი ({country}-ში):",
+        "invalid_city": "გთხოვთ, შეიყვანოთ კორექტული ქალაქის სახელი.",
+        "data_collection_complete": "მონაცემების შეგროვება დასრულებულია. ვიწყებ რუკის შედგენას...",
+        "cancel_button_text": "/cancel",
+        "saved_data_exists_1": "თქვენ უკვე შენახული გაქვთ რუკა ({name}, {day}/{month}/{year}...).",
+        "saved_data_exists_2": "გსურთ მისი ნახვა თუ ახლის შედგენა?",
+        "use_saved_chart_button": "კი, ვნახოთ შენახული რუკა",
+        "enter_new_data_button": "არა, შევიყვანოთ ახალი მონაცემები",
+        "cancel_creation_button": "გაუქმება",
+        "using_saved_chart": "აი, თქვენი შენახული ნატალური რუკა:",
+        "chart_generation_cancelled": "რუკის შექმნა გაუქმებულია.",
+        "invalid_choice": "არასწორი არჩევანი. გთხოვთ, სცადოთ თავიდან /createchart.",
+        "data_saved": "მონაცემები შენახულია.",
+        "data_save_error": "მონაცემების შენახვისას მოხდა შეცდომა.",
+        "chart_ready_menu_prompt": "თქვენი რუკა მზადაა. ეხლა კი შევუდგეთ თქვენს ყოველდღიურ მომსახურებას:",
+        "my_data_header": "თქვენი შენახული მონაცემებია:\n",
+        "my_data_name": "  <b>სახელი:</b> {name}\n",
+        "my_data_date": "  <b>თარიღი:</b> {day}/{month}/{year}\n",
+        "my_data_time": "  <b>დრო:</b> {hour}:{minute}\n",
+        "my_data_city": "  <b>ქალაქი:</b> {city}\n",
+        "my_data_country": "  <b>ქვეყანა:</b> {nation_or_text}\n",
+        "no_data_found": "თქვენ არ გაქვთ შენახული მონაცემები. გამოიყენეთ /createchart დასამატებლად.",
+        "data_deleted_success": "თქვენი შენახული მონაცემები და რუკა წარმატებით წაიშალა.",
+        "data_delete_error": "მონაცემების წაშლისას მოხდა შეცდომა ან მონაცემები არ არსებობდა.",
+        "processing_kerykeion": "მონაცემები მიღებულია, ვიწყებ ასტროლოგიური მონაცემების გამოთვლას...",
+        "geonames_warning_user": "⚠️ გაფრთხილება: GeoNames მომხმარებლის სახელი არ არის დაყენებული. ქალაქის ძებნა შეიძლება ვერ მოხერხდეს ან არასწორი იყოს. რეკომენდებულია მისი დამატება.",
+        "kerykeion_city_error": "შეცდომა: Kerykeion-მა ვერ იპოვა მონაცემები ქალაქისთვის '{city}'. გთხოვთ, შეამოწმოთ ქალაქის სახელი და სცადოთ თავიდან /createchart.",
+        "kerykeion_general_error": "შეცდომა მოხდა ასტროლოგიური მონაცემების გამოთვლისას.",
+        "aspect_calculation_error_user": "⚠️ გაფრთხილება: ასპექტების გამოთვლისას მოხდა შეცდომა.",
+        "gemini_prompt_start": "ასტროლოგიური მონაცემები გამოთვლილია. ვიწყებ დეტალური ინტერპრეტაციების გენერირებას Gemini-სთან...\n⏳ ამას შეიძლება 1-3 წუთი დასჭირდეს.",
+        "gemini_interpretation_failed": "ინტერპრეტაციების გენერირება ვერ მოხერხდა. სცადეთ მოგვიანებით.",
+        "chart_error_generic": "მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.",
+        "main_menu_button_view_chart": "📜 რუკის ნახვა",
+        "main_menu_button_dream": "🌙 სიზმრის ახსნა",
+        "main_menu_button_horoscope": "🔮 ჰოროსკოპი",
+        "main_menu_button_palmistry": "🖐️ ქირომანტია",
+        "main_menu_button_coffee": "☕ ყავაში ჩახედვა",
+        "main_menu_button_delete_data": "🗑️ მონაცემების წაშლა",
+        "main_menu_button_help": "❓ დახმარება",
+        "feature_coming_soon": "ფუნქცია '{feature_name}' მალე დაემატება. გთხოვთ, აირჩიოთ სხვა მოქმედება:",
+        # Gemini Prompts
+        "gemini_main_prompt_intro": "შენ ხარ გამოცდილი, პროფესიონალი ასტროლოგი, რომელიც წერს სიღრმისეულ და დეტალურ ნატალური რუკის ანალიზს {language} ენაზე.",
+        "gemini_main_prompt_instruction_1": "მიჰყევი მოთხოვნილ სტრუქტურას და თითოეულ პუნქტზე დაწერე 3-5 ვრცელი წინადადება, რომელიც ხსნის მის მნიშვნელობას მოცემული ადამიანისთვის ({name}).",
+        "gemini_main_prompt_instruction_2": "გამოიყენე პროფესიონალური, მაგრამ ამავდროულად თბილი და გასაგები ენა. მოერიდე დაზეპირებულ ფრაზებს.",
+        "gemini_main_prompt_instruction_3": "იყავი მაქსიმალურად ზუსტი და დეტალური, PDF ნიმუშის მსგავსად.",
+        "gemini_data_header": "**მონაცემები:**",
+        "gemini_name": "სახელი: {name}",
+        "gemini_birth_date_time": "დაბადების თარიღი: {day}/{month}/{year}, {hour:02d} საათი და {minute:02d} წუთი",
+        "gemini_birth_location": "დაბადების ადგილი: {city}{location_nation_suffix}",
+        "gemini_systems_used": "გამოყენებული სისტემები: ზოდიაქო - ტროპიკული, სახლები - პლაციდუსი",
+        "gemini_planet_positions_header": "**პლანეტების მდებარეობა (ნიშანი, გრადუსი, სახლი, რეტროგრადულობა):**",
+        "gemini_aspects_header": "**მნიშვნელოვანი ასპექტები (პლანეტა1, ასპექტი, პლანეტა2, ორბისი):**",
+        "gemini_task_header": "**დავალება:**",
+        "gemini_task_instruction_1": "დაწერე სრული ანალიზი, დაყოფილი შემდეგ სექციებად. გამოიყენე ზუსტად ეს სექციების სახელები და ფორმატირება (მაგ., `[SECTION: PlanetsInSignsStart]`):",
+        "gemini_section_pis_start": "[SECTION: PlanetsInSignsStart]",
+        "gemini_pis_instruction": "(აქ იწყება პლანეტები ნიშნებში. თითოეული პლანეტისთვის (Sun-Pluto) დაწერე დეტალური ანალიზი მის ნიშანში. მაგალითად: \"მზე ვერძში: ...\")",
+        "gemini_section_pis_end": "[SECTION: PlanetsInSignsEnd]",
+        "gemini_section_pih_start": "[SECTION: PlanetsInHousesStart]",
+        "gemini_pih_instruction": "(აქ იწყება პლანეტები სახლებში. თითოეული პლანეტისთვის (Sun-Pluto) დაწერე დეტალური ანალიზი მის სახლში, თუ სახლის ნომერი ცნობილია. მაგალითად: \"მთვარე მე-5 სახლში: ...\")",
+        "gemini_section_pih_end": "[SECTION: PlanetsInHousesEnd]",
+        "gemini_section_aspects_start": "[SECTION: AspectsStart]",
+        "gemini_aspects_instruction": "(აქ იწყება ასპექტები. თითოეული ჩამოთვლილი ასპექტისთვის დაწერე დეტალური ანალიზი. მაგალითად: \"მზე შეერთება იუპიტერი: ...\")",
+        "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
+        "gemini_final_instruction": "გთხოვ, პასუხი დააბრუნო მხოლოდ ამ სამი სექციის ტექსტით, ტეგებს შორის. არ დაამატო შესავალი ან დასკვნითი სიტყვები."
+    },
+    "en": {
+        "language_chosen": "You have selected English.",
+        "welcome_new_user": "First, we need to create your natal chart to make our interaction more personal and accurate.",
+        "create_chart_button_text": "📜 Create Chart",
+        "welcome_existing_user_1": "Your saved data is:",
+        "welcome_existing_user_2": "Use /createchart to generate a new chart (you can choose to use saved data).",
+        "menu_mydata": "/mydata - Show saved data.",
+        "menu_deletedata": "/deletedata - Delete saved data.",
+        "start_createchart_no_data": "Use the /createchart command to generate your natal chart.",
+        "chart_creation_prompt": "To create your natal chart, I need your birth details.\nYou can cancel at any time by sending /cancel.",
+        "ask_name": "Please enter the name for whom the chart is being made:",
+        "name_thanks": "Thank you, {name}.\nNow, please enter the full date of birth in the format: <b>YYYY/MM/DD</b> (e.g., <code>1989/11/29</code>):",
+        "invalid_name": "Name must contain at least 2 characters. Please try again:",
+        "invalid_date_format": "Incorrect date format. Please enter in <b>YYYY/MM/DD</b> format (e.g., <code>1989/11/29</code>):",
+        "invalid_year_range": "Year must be between {start_year} and {end_year}. Please enter the date in <b>YYYY/MM/DD</b> format:",
+        "ask_time": "Thank you. Now, please enter the time of birth in <b>HH:MM</b> format (e.g., <code>15:30</code>), or press the 'Time Unknown' button.",
+        "time_unknown_button": "Time Unknown (12:00)",
+        "invalid_time_format": "Incorrect time format. Please enter in <b>HH:MM</b> format (e.g., <code>15:30</code>) or press 'Time Unknown'.",
+        "ask_country": "Enter the country of birth (e.g., Georgia, Germany):",
+        "invalid_country": "Please enter a valid country name.",
+        "ask_city": "Enter the city of birth (in {country}):",
+        "invalid_city": "Please enter a valid city name.",
+        "data_collection_complete": "Data collection complete. Starting chart generation...",
+        "cancel_button_text": "/cancel",
+        "saved_data_exists_1": "You already have a saved chart ({name}, {day}/{month}/{year}...).",
+        "saved_data_exists_2": "Would you like to view it or create a new one?",
+        "use_saved_chart_button": "Yes, view saved chart",
+        "enter_new_data_button": "No, enter new data",
+        "cancel_creation_button": "Cancel",
+        "using_saved_chart": "Here is your saved natal chart:",
+        "chart_generation_cancelled": "Chart creation cancelled.",
+        "invalid_choice": "Invalid choice. Please try /createchart again.",
+        "data_saved": "Data saved.",
+        "data_save_error": "Error saving data.",
+        "chart_ready_menu_prompt": "Your chart is ready. Now we can proceed with your daily services:",
+        "my_data_header": "Your saved data:\n",
+        "my_data_name": "  <b>Name:</b> {name}\n",
+        "my_data_date": "  <b>Date:</b> {day}/{month}/{year}\n",
+        "my_data_time": "  <b>Time:</b> {hour}:{minute}\n",
+        "my_data_city": "  <b>City:</b> {city}\n",
+        "my_data_country": "  <b>Country:</b> {nation_or_text}\n",
+        "no_data_found": "You have no saved data. Use /createchart to add it.",
+        "data_deleted_success": "Your saved data and chart have been successfully deleted.",
+        "data_delete_error": "Error deleting data, or no data existed.",
+        "processing_kerykeion": "Data received, starting astrological calculations...",
+        "geonames_warning_user": "⚠️ Warning: GEONAMES_USERNAME is not set. City lookup might fail or be inaccurate. Adding it is recommended.",
+        "kerykeion_city_error": "Error: Kerykeion could not find data for the city '{city}'. Please check the city name and try /createchart again.",
+        "kerykeion_general_error": "An error occurred during astrological data calculation.",
+        "aspect_calculation_error_user": "⚠️ Warning: An error occurred during aspect calculation.",
+        "gemini_prompt_start": "Astrological data calculated. Starting generation of detailed interpretations with Gemini...\n⏳ This may take 1-3 minutes.",
+        "gemini_interpretation_failed": "Failed to generate interpretations. Please try again later.",
+        "chart_error_generic": "An unexpected error occurred during chart generation.",
+        "main_menu_button_view_chart": "📜 View Chart",
+        "main_menu_button_dream": "🌙 Dream Interpretation",
+        "main_menu_button_horoscope": "🔮 Horoscope",
+        "main_menu_button_palmistry": "🖐️ Palmistry",
+        "main_menu_button_coffee": "☕ Coffee Reading",
+        "main_menu_button_delete_data": "🗑️ Delete My Data",
+        "main_menu_button_help": "❓ Help",
+        "feature_coming_soon": "The '{feature_name}' feature will be added soon. Please choose another action:",
+        # Gemini Prompts for English
+        "gemini_main_prompt_intro": "You are an experienced, professional astrologer writing an in-depth and detailed natal chart analysis in {language}.",
+        "gemini_main_prompt_instruction_1": "Follow the requested structure and for each point, write at least 3-5 detailed sentences explaining its significance for the given person ({name}).",
+        "gemini_main_prompt_instruction_2": "Use professional, yet warm and understandable language, as if talking to a friend. Avoid clichéd phrases.",
+        "gemini_main_prompt_instruction_3": "Be as accurate and detailed as possible, similar to the PDF sample.",
+        "gemini_data_header": "**Birth Data:**",
+        "gemini_name": "Name: {name}",
+        "gemini_birth_date_time": "Date of Birth: {day}/{month}/{year}, {hour:02d}h {minute:02d}m",
+        "gemini_birth_location": "Place of Birth: {city}{location_nation_suffix}",
+        "gemini_systems_used": "Systems Used: Zodiac - Tropical, Houses - Placidus",
+        "gemini_planet_positions_header": "**Planetary Positions (Sign, Degree, House, Retrograde):**",
+        "gemini_aspects_header": "**Significant Aspects (Planet1, Aspect, Planet2, Orb):**",
+        "gemini_task_header": "**Task:**",
+        "gemini_task_instruction_1": "Write a full analysis, divided into the following sections. Use these exact section names and formatting (e.g., `[SECTION: PlanetsInSignsStart]`):",
+        "gemini_section_pis_start": "[SECTION: PlanetsInSignsStart]",
+        "gemini_pis_instruction": "(Planets in Signs begin here. For each planet (Sun-Pluto), write a detailed analysis in its sign. For example: \"Sun in Aries: ...\")",
+        "gemini_section_pis_end": "[SECTION: PlanetsInSignsEnd]",
+        "gemini_section_pih_start": "[SECTION: PlanetsInHousesStart]",
+        "gemini_pih_instruction": "(Planets in Houses begin here. For each planet (Sun-Pluto), write a detailed analysis in its house, if the house number is known. For example: \"Moon in 5th House: ...\")",
+        "gemini_section_pih_end": "[SECTION: PlanetsInHousesEnd]",
+        "gemini_section_aspects_start": "[SECTION: AspectsStart]",
+        "gemini_aspects_instruction": "(Aspects begin here. For each listed aspect, write a detailed analysis. For example: \"Sun conjunct Jupiter: ...\")",
+        "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
+        "gemini_final_instruction": "Please return the text for these three sections only, between the tags. Do not add an introduction or concluding remarks."
+    },
+    "ru": { # რუსული თარგმანები (საჭიროებს შევსებას)
+        "language_chosen": "Вы выбрали русский язык.",
+        "welcome_new_user": "Прежде всего, нам нужно составить вашу натальную карту, чтобы наше общение было более персонализированным и точным.",
+        "create_chart_button_text": "📜 Составить карту",
+        "ask_name": "Пожалуйста, введите имя, для кого составляется карта:",
+        "name_thanks": "Спасибо, {name}.\nТеперь, пожалуйста, введите полную дату рождения в формате: <b>ГГГГ/ММ/ДД</b> (например, <code>1989/11/29</code>):",
+        # ... დანარჩენი რუსული თარგმანები ...
+        "main_menu_text": "Выберите действие:",
+        "view_chart_button": "📜 Посмотреть карту",
+        "dream_button": "🌙 Толкование снов",
+        "feature_coming_soon": "Функция '{feature_name}' скоро будет добавлена. Пожалуйста, выберите другое действие:",
+        # Gemini Prompts for Russian
+        "gemini_main_prompt_intro": "Вы опытный, профессиональный астролог, составляющий глубокий и подробный анализ натальной карты на {language} языке.",
+        "gemini_main_prompt_instruction_1": "Следуйте запрошенной структуре и по каждому пункту напишите не менее 3-5 подробных предложений, объясняющих его значение для данного человека ({name}).",
+        "gemini_main_prompt_instruction_2": "Используйте профессиональный, но в то же время теплый и понятный язык, как будто разговариваете с другом. Избегайте шаблонных фраз.",
+        "gemini_main_prompt_instruction_3": "Будьте максимально точны и подробны, как в примере PDF.",
+        "gemini_data_header": "**Данные рождения:**",
+        "gemini_name": "Имя: {name}",
+        "gemini_birth_date_time": "Дата рождения: {day}/{month}/{year}, {hour:02d} ч {minute:02d} мин",
+        "gemini_birth_location": "Место рождения: {city}{location_nation_suffix}",
+        "gemini_systems_used": "Используемые системы: Зодиак - Тропический, Дома - Плацидус",
+        "gemini_planet_positions_header": "**Положения планет (Знак, Градус, Дом, Ретроградность):**",
+        "gemini_aspects_header": "**Значимые аспекты (Планета1, Аспект, Планета2, Орбис):**",
+        "gemini_task_header": "**Задание:**",
+        "gemini_task_instruction_1": "Напишите полный анализ, разделенный на следующие секции. Используйте точно эти названия секций и форматирование (например, `[SECTION: PlanetsInSignsStart]`):",
+        "gemini_section_pis_start": "[SECTION: PlanetsInSignsStart]",
+        "gemini_pis_instruction": "(Здесь начинаются Планеты в Знаках. Для каждой планеты (Солнце-Плутон) напишите подробный анализ в ее знаке. Например: \"Солнце в Овне: ...\")",
+        "gemini_section_pis_end": "[SECTION: PlanetsInSignsEnd]",
+        "gemini_section_pih_start": "[SECTION: PlanetsInHousesStart]",
+        "gemini_pih_instruction": "(Здесь начинаются Планеты в Домах. Для каждой планеты (Солнце-Плутон) напишите подробный анализ в ее доме, если номер дома известен. Например: \"Луна в 5-м Доме: ...\")",
+        "gemini_section_pih_end": "[SECTION: PlanetsInHousesEnd]",
+        "gemini_section_aspects_start": "[SECTION: AspectsStart]",
+        "gemini_aspects_instruction": "(Здесь начинаются Аспекты. Для каждого перечисленного аспекта напишите подробный анализ. Например: \"Солнце соединение Юпитер: ...\")",
+        "gemini_section_aspects_end": "[SECTION: AspectsEnd]",
+        "gemini_final_instruction": "Пожалуйста, верните текст только для этих трех секций, между тегами. Не добавляйте вступления или заключительные слова."
+    }
 }
-aspect_translations = {
-    "conjunction": "შეერთება", "opposition": "ოპოზიცია", "square": "კვადრატი",
-    "trine": "ტრიგონი", "sextile": "სექსტილი"
-}
-aspect_symbols = {
-    "conjunction": "☌", "opposition": "☍", "square": "□",
-    "trine": "△", "sextile": "∗"
-}
+DEFAULT_LANGUAGE = "ka"
 
-# --- Gemini-სთან კომუნიკაციის ფუნქცია ---
-# (get_gemini_interpretation - უცვლელია)
-async def get_gemini_interpretation(prompt: str) -> str:
-    if not gemini_model:
-        return "(Gemini API მიუწვდომელია)"
-    try:
-        request_options = {"timeout": 120}
-        response = await gemini_model.generate_content_async(
-            prompt,
-            generation_config={"response_mime_type": "text/plain"},
-            request_options=request_options
-            )
-        if not response.candidates:
-            feedback = response.prompt_feedback if hasattr(response, 'prompt_feedback') else None
-            block_reason = feedback.block_reason if hasattr(feedback, 'block_reason') else 'Unknown'
-            safety_ratings = feedback.safety_ratings if hasattr(feedback, 'safety_ratings') else 'N/A'
-            logger.warning(f"Gemini response blocked or empty. Prompt: '{prompt[:100]}...'. Reason: {block_reason}, Ratings: {safety_ratings}")
-            return f"(Gemini-მ პასუხი დაბლოკა ან ცარიელია. მიზეზი: {block_reason})"
-        if hasattr(response.candidates[0].content, 'parts') and response.candidates[0].content.parts:
-             full_text = "".join(part.text for part in response.candidates[0].content.parts)
-             return full_text.strip()
-        else:
-            logger.warning(f"Gemini response candidate did not contain valid parts. Prompt: '{prompt[:100]}...'. Response: {response}")
-            return "(Gemini-მ სტრუქტურული პასუხი არ დააბრუნა)"
-    except generation_types.StopCandidateException as e:
-         logger.warning(f"Gemini generation stopped: {e}. Prompt: '{prompt[:100]}...'")
-         return "(Gemini-მ პასუხის გენერაცია შეწყვიტა)"
-    except Exception as e:
-        logger.error(f"Gemini API error ({type(e).__name__}): {e}", exc_info=True)
-        return f"(ინტერპრეტაციის გენერირებისას მოხდა შეცდომა: {type(e).__name__})"
+def get_text(key: str, lang_code: str | None = None) -> str:
+    """აბრუნებს ტექსტს მოთხოვნილი ენისთვის, ან ნაგულისხმევს თუ თარგმანი არ არის."""
+    if not lang_code:
+        lang_code = DEFAULT_LANGUAGE
+    # ვცდილობთ ვიპოვოთ ტექსტი არჩეულ ენაზე, თუ არ არის - ინგლისურზე, თუ არც ის - ქართულზე
+    return translations.get(lang_code, translations[DEFAULT_LANGUAGE]).get(key, f"TR_ERROR: Missing translation for '{key}' in lang '{lang_code}'")
 
-# --- დამხმარე ფუნქცია ტექსტის ნაწილებად დასაყოფად ---
-# (split_text - უცვლელია)
-def split_text(text: str, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
-    parts = []
-    current_part = ""
-    for line in text.splitlines(keepends=True):
-        if len((current_part + line).encode('utf-8')) > limit - 10: # -10 ზღვარისთვის
-            if current_part: # თუ რამე დაგროვდა, ვამატებთ
-                parts.append(current_part.strip())
-            current_part = line
-        else:
-            current_part += line
-    if current_part: # ბოლო დარჩენილი ნაწილი
-        parts.append(current_part.strip())
-
-    # თუ ნაწილი ცარიელია, ვშლით
-    return [p for p in parts if p]
-
-
-# --- რუკის გენერირების და გაგზავნის ფუნქცია ---
-async def generate_and_send_chart(user_data: dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    name = user_data.get('name', 'User')
-    year = user_data.get('year')
-    month = user_data.get('month')
-    day = user_data.get('day')
-    hour = user_data.get('hour')
-    minute = user_data.get('minute')
-    city = user_data.get('city')
-    nation = user_data.get('nation')
-
-    if not all([name, year, month, day, hour, minute, city]):
-         await context.bot.send_message(chat_id=chat_id, text="მონაცემები არასრულია რუკის შესადგენად.")
-         return
-
-    logger.info(f"Generating Kerykeion data for: {name}, {day}/{month}/{year} {hour}:{minute}, {city}, {nation}")
-    processing_message = await context.bot.send_message(chat_id=chat_id, text="მონაცემები მიღებულია, ვიწყებ ასტროლოგიური მონაცემების გამოთვლას...")
-
-    try:
-        if not GEONAMES_USERNAME:
-        logger.warning("GEONAMES_USERNAME not set in .env. Kerykeion will use default, which can be unreliable.")
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: GeoNames მომხმარებლის სახელი არ არის დაყენებული...")
-        # ...
-
-    logger.info(f"Calling AstrologicalSubject with geonames_username='{GEONAMES_USERNAME}'")
-    try:
-        subject_instance = await asyncio.to_thread(
-            AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME # <-- აქ გადავცემთ
-        )
-    except RuntimeError:
-         logger.warning(f"asyncio.to_thread failed, calling Kerykeion directly.")
-         subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME)
-
-        logger.info(f"Calling AstrologicalSubject with geonames_username='{GEONAMES_USERNAME}'")
-    try:
-            subject_instance = await asyncio.to_thread(
-                AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME
-            )
-        except RuntimeError:
-             logger.warning(f"asyncio.to_thread failed, calling Kerykeion directly.")
-             subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME)
-        logger.info(f"Kerykeion data generated for {name}. Sun at {subject_instance.sun['position']:.2f} {subject_instance.sun['sign']}.")
-
-        # --- ასპექტების გამოთვლა (შესწორებული) ---
-    logger.info("Calculating aspects...")
-    aspects_data_str_for_prompt = ""
-    try:
-            # Kerykeion-ის NatalAspects სწორად გამოძახება
-            aspect_calculator = NatalAspects(
-                subject_instance,
-                aspects_list=MAJOR_ASPECTS_TYPES, # რა ტიპის ასპექტები ვეძებოთ
-                planets_to_consider=ASPECT_PLANETS, # რომელი პლანეტები ჩავრთოთ
-                orb_dictionary=ASPECT_ORBS
-            )
-            all_filtered_aspects = aspect_calculator.get_relevant_aspects() # ეს აბრუნებს გაფილტრულ სიას
-            logger.info(f"Found {len(all_filtered_aspects)} major aspects based on configuration.")
-
-            if all_filtered_aspects:
-                for aspect in all_filtered_aspects:
-                    p1 = aspect.get('p1_name')
-                    p2 = aspect.get('p2_name')
-                    aspect_type = aspect.get('aspect')
-                    orb = aspect.get('orbit', 0.0)
-                    if p1 and p2 and aspect_type:
-                         aspect_name_ge = aspect_translations.get(aspect_type, aspect_type)
-                         aspects_data_str_for_prompt += f"- {p1} {aspect_name_ge} {p2} (ორბისი {orb:.1f}°)\n"
-            if not aspects_data_str_for_prompt:
-                 aspects_data_str_for_prompt = "- მნიშვნელოვანი მაჟორული ასპექტები ვერ მოიძებნა მითითებული პარამეტრებით.\n"
-        except Exception as aspect_err:
-             logger.error(f"Error calculating aspects for {name}: {aspect_err}", exc_info=True)
-             aspects_data_str_for_prompt = "- ასპექტების გამოთვლისას მოხდა შეცდომა.\n"
-             await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: ასპექტების გამოთვლისას მოხდა შეცდომა.")
-
-
-        # --- მონაცემების მომზადება Prompt-ისთვის ---
-        planets_data_str_for_prompt = ""
-        planet_list_for_prompt = ['Sun', 'Moon', 'Mercury', 'Venus', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune', 'Pluto', 'Ascendant', 'Midheaven']
-        for planet_name in planet_list_for_prompt:
-            try:
-                 obj_name_in_kerykeion = planet_name.lower()
-                 if planet_name == "Midheaven": obj_name_in_kerykeion = "mc" # Kerykeion attribute is 'mc'
-                 elif planet_name == "Ascendant": obj_name_in_kerykeion = "ascendant" # Kerykeion attribute is 'ascendant'
-
-                 planet_obj = getattr(subject_instance, obj_name_in_kerykeion)
-
-                 sign = planet_obj.get('sign', '?')
-                 pos = planet_obj.get('position', 0.0)
-                 house_val = planet_obj.get('house') # შეიძლება იყოს None ან რიცხვი
-                 house_str = f", {house_val}-ე სახლი" if isinstance(house_val, int) else ", სახლი?"
-                 retro = " (R)" if planet_obj.get('isRetro') == 'true' else ""
-                 planets_data_str_for_prompt += f"- {planet_name}: {sign} {pos:.2f}°{house_str}{retro}\n"
-            except AttributeError: # თუ 'mc' ან 'ascendant' არ არის პირდაპირი ატრიბუტი ასე
-                 if planet_name == "Ascendant": planet_obj = subject_instance.first_house # ალტერნატივა
-                 elif planet_name == "Midheaven": planet_obj = subject_instance.tenth_house # ალტერნატივა
-                 else: planet_obj = None
-
-                 if planet_obj:
-                     sign = planet_obj.get('sign', '?')
-                     pos = planet_obj.get('position', 0.0)
-                     house_str = "" # Asc/MC-სთვის სახლს არ ვუთითებთ ამ ფორმატში
-                     planets_data_str_for_prompt += f"- {planet_name}: {sign} {pos:.2f}°\n"
-                 else:
-                     logger.error(f"Error getting data for {planet_name} (attribute not found)")
-                     planets_data_str_for_prompt += f"- {planet_name}: მონაცემების წაკითხვის შეცდომა\n"
-
-            except Exception as e:
-                 logger.error(f"Error getting full data for {planet_name}: {e}")
-                 planets_data_str_for_prompt += f"- {planet_name}: მონაცემების სრული წაკითხვის შეცდომა\n"
-
-
-        large_prompt = f"""შენ ხარ გამოცდილი, პროფესიონალი ასტროლოგი, რომელიც წერს სიღრმისეულ და დეტალურ ნატალური რუკის ანალიზს ქართულ ენაზე.
-მიჰყევი მოთხოვნილ სტრუქტურას და თითოეულ პუნქტზე დაწერე მინიმუმ 3-4 ვრცელი წინადადება, რომელიც ხსნის მის მნიშვნელობას მოცემული ადამიანისთვის ({name}).
-გამოიყენე პროფესიონალური, მაგრამ გასაგები ენა. მოერიდე დაზეპირებულ ფრაზებს. იყავი მაქსიმალურად ზუსტი და დეტალური, PDF ნიმუშის მსგავსად.
-
-**მონაცემები:**
-სახელი: {name}
-თარიღი: {day}/{month}/{year} {hour:02d}:{minute:02d}
-ადგილმდებარეობა: {city}{f', {nation}' if nation else ''}
-ზოდიაქო: ტროპიკული
-სახლების სისტემა: პლაციდუსი
-
-**პლანეტების მდებარეობა (ნიშანი, გრადუსი, სახლი, რეტროგრადულობა):**
-{planets_data_str_for_prompt}
-**მნიშვნელოვანი ასპექტები (პლანეტა1, ასპექტი, პლანეტა2, ორბისი):**
-{aspects_data_str_for_prompt}
-**დავალება:**
-დაწერე სრული ანალიზი, დაყოფილი შემდეგ სექციებად. გამოიყენე ზუსტად ეს სექციების სახელები და ფორმატირება (მაგ., `[SECTION: PlanetsInSigns]`):
-
-[SECTION: PlanetsInSigns]
-(აქ დაწერე დეტალური ანალიზი თითოეული პლანეტისთვის (Sun-Pluto) მის ნიშანში. თითოეულზე 3-4 ვრცელი წინადადება მინიმუმ.)
-
-[SECTION: PlanetsInHouses]
-(აქ დაწერე დეტალური ანალიზი თითოეული პლანეტისთვის (Sun-Pluto) მის სახლში, თუ სახლის ნომერი ცნობილია. თითოეულზე 3-4 ვრცელი წინადადება მინიმუმ.)
-
-[SECTION: Aspects]
-(აქ დაწერე დეტალური ანალიზი თითოეული ჩამოთვლილი ასპექტისთვის. თითოეულზე 3-4 ვრცელი წინადადება მინიმუმ.)
-
-გთხოვ, პასუხი დააბრუნო მხოლოდ ამ სამი სექციის ტექსტით, დაწყებული `[SECTION: PlanetsInSigns]`-ით. არ დაამატო შესავალი ან დასკვნითი სიტყვები.
-"""
-        await processing_message.edit_text(text="""ასტროლოგიური მონაცემები გამოთვლილია. ვიწყებ დეტალური ინტერპრეტაციების გენერირებას Gemini-სთან...
-⏳ ამას შეიძლება 1-2 წუთი დასჭირდეს.""", parse_mode=ParseMode.HTML)
-
-        logger.info(f"Sending large prompt to Gemini for user {chat_id}. Prompt length: {len(large_prompt)}")
-        full_interpretation_text = await get_gemini_interpretation(large_prompt)
-        logger.info(f"Received full interpretation from Gemini for user {chat_id}. Length: {len(full_interpretation_text)}")
-
-        final_report_parts = []
-        base_info_text = (
-            f"✨ {name}-ს ნატალური რუკა ✨\n\n"
-            f"<b>დაბადების მონაცემები:</b> {day}/{month}/{year}, {hour:02d}:{minute:02d}, {city}{f', {nation}' if nation else ''}\n"
-            f"<b>ზოდიაქო:</b> ტროპიკული, <b>სახლები:</b> პლაციდუსი\n\n"
-        )
-        try: sun_info = subject_instance.sun; base_info_text += f"{planet_emojis.get('Sun')} <b>მზე:</b> {sun_info['sign']} (<code>{sun_info['position']:.2f}°</code>)\n"
-        except: pass
-        try: asc_info = subject_instance.ascendant; base_info_text += f"{planet_emojis.get('Ascendant')} <b>ასცედენტი:</b> {asc_info['sign']} (<code>{asc_info['position']:.2f}°</code>)\n"
-        except: pass
-        time_note = "\n<i>(შენიშვნა: დრო მითითებულია 12:00. ასცედენტი და სახლები შეიძლება არ იყოს ზუსტი.)</i>" if hour == 12 and minute == 0 else ""
-        base_info_text += time_note + "\n"
-        final_report_parts.append(base_info_text)
-
-        planets_in_signs_match = re.search(r"\[SECTION:\s*PlanetsInSigns\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
-        planets_in_houses_match = re.search(r"\[SECTION:\s*PlanetsInHouses\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
-        aspects_match = re.search(r"\[SECTION:\s*Aspects\s*\](.*?)(?:\[SECTION:|\Z)", full_interpretation_text, re.DOTALL | re.IGNORECASE)
-
-        if planets_in_signs_match and planets_in_signs_match.group(1).strip():
-            final_report_parts.append(f"\n--- 🪐 <b>პლანეტები ნიშნებში</b> ---\n\n{planets_in_signs_match.group(1).strip()}")
-        else: logger.warning("Could not parse [SECTION: PlanetsInSigns] or it was empty.")
-
-        if planets_in_houses_match and planets_in_houses_match.group(1).strip():
-            final_report_parts.append(f"\n--- 🏠 <b>პლანეტები სახლებში</b> ---\n\n{planets_in_houses_match.group(1).strip()}")
-        else: logger.warning("Could not parse [SECTION: PlanetsInHouses] or it was empty.")
-
-        if aspects_match and aspects_match.group(1).strip():
-            final_report_parts.append(f"\n--- ✨ <b>ასპექტები</b> ---\n\n{aspects_match.group(1).strip()}")
-        else: logger.warning("Could not parse [SECTION: Aspects] or it was empty.")
-
-        if len(final_report_parts) == 1: # Only base_info_text
-            if full_interpretation_text.startswith("("): # Gemini error message
-                 final_report_parts.append(f"\n<b>ინტერპრეტაცია ვერ მოხერხდა:</b>\n{full_interpretation_text}")
-            elif len(full_interpretation_text) > 10: # Text exists but no sections
-                 logger.warning("Could not parse sections, showing raw Gemini text.")
-                 final_report_parts.append(f"\n<b>ინტერპრეტაცია (დაუმუშავებელი):</b>\n{full_interpretation_text}")
-
-        full_response_text = "".join(final_report_parts).strip()
-
-        if not full_response_text or full_response_text == base_info_text.strip():
-            await processing_message.edit_text(text="ინტერპრეტაციების გენერირება ვერ მოხერხდა. სცადეთ მოგვიანებით.")
-            return
-
-        parts = split_text(full_response_text)
-        logger.info(f"Sending response in {len(parts)} parts.")
-        await processing_message.edit_text(text=parts[0], parse_mode=ParseMode.HTML)
-        for part in parts[1:]:
-            await context.bot.send_message(chat_id=chat_id, text=part, parse_mode=ParseMode.HTML)
-        logger.info(f"Full detailed chart sent for {name}.")
-
-    except KerykeionException as ke:
-        logger.error(f"KerykeionException for {name}: {ke}", exc_info=False) # False to avoid full traceback for known errors
-        await processing_message.edit_text(text=f"შეცდომა ასტროლოგიური მონაცემების გამოთვლისას: {ke}. გთხოვთ, შეამოწმოთ შეყვანილი მონაცემები, განსაკუთრებით ქალაქი. დარწმუნდით, რომ GEONAMES_USERNAME გარემოს ცვლადი სწორად არის დაყენებული.")
-    except ConnectionError as ce:
-        logger.error(f"ConnectionError during chart generation for {name}: {ce}")
-        await processing_message.edit_text(text=f"კავშირის შეცდომა მოხდა (სავარაუდოდ GeoNames ან Gemini). სცადეთ მოგვიანებით.")
-    except Exception as e:
-        logger.error(f"An unexpected error occurred generating chart for {name}: {e}", exc_info=True)
-        try:
-            await processing_message.edit_text(text=f"მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას: {type(e).__name__}")
-        except Exception:
-             await context.bot.send_message(chat_id=chat_id, text="მოულოდნელი შეცდომა მოხდა რუკის გენერაციისას.")
-
+# --- ConversationHandler-ის მდგომარეობები ---
+(LANG_CHOICE, NAME, BIRTH_DATE, BIRTH_TIME, COUNTRY, CITY, SAVED_DATA_CHOICE_LANG) = range(7)
 
 # --- Handler ფუნქციები ---
-# (start, create_chart_start, handle_saved_data_choice, handle_name, ..., cancel, show_my_data, delete_data - უცვლელია)
-# (დავტოვე მხოლოდ start, რადგან დანარჩენი იგივეა)
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    user_data = get_user_data(user.id)
-    start_text = rf"გამარჯობა {user.mention_html()}! მე ვარ Subconscious ბოტი."
-    if user_data:
-         start_text += f"\n\nთქვენი შენახული მონაცემებია: <b>{user_data.get('name')}</b> ({user_data.get('day')}/{user_data.get('month')}/{user_data.get('year')})."
-         start_text += "\n\nგამოიყენეთ /createchart ახალი რუკის შესადგენად (შეგიძლიათ აირჩიოთ შენახული მონაცემების გამოყენება)."
-         start_text += "\n/mydata - შენახული მონაცემების ჩვენება."
-         start_text += "\n/deletedata - შენახული მონაცემების წაშლა."
-    else:
-        start_text += "\n\nნატალური რუკის შესაქმნელად გამოიყენეთ /createchart ბრძანება."
-    await update.message.reply_html(start_text)
 
-(NAME, YEAR, MONTH, DAY, HOUR, MINUTE, CITY, NATION, SAVED_DATA_CHOICE) = range(9)
-
-async def create_chart_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Asks for language selection or proceeds if language is known."""
     user_id = update.effective_user.id
-    logger.info(f"User {user_id} started chart creation process with /createchart.")
-    context.user_data.clear()
+    user_data_db = get_user_data(user_id) # ვიღებთ მონაცემებს ბაზიდან (ენის ჩათვლით)
+
+    if user_data_db and user_data_db.get('language_code'):
+        lang_code = user_data_db['language_code']
+        context.user_data['lang_code'] = lang_code # ვინახავთ სესიისთვის
+        logger.info(f"User {user_id} already has language set to: {lang_code}")
+        # თუ მონაცემებიც აქვს, ვაჩვენებთ მთავარ მენიუს
+        if user_data_db.get('name'): # ვამოწმებთ, თუ ძირითადი მონაცემებიც შენახულია
+            welcome_text = get_text("welcome_existing_user_1", lang_code) + \
+                           f" <b>{user_data_db.get('name')}</b> ({user_data_db.get('day')}/{user_data_db.get('month')}/{user_data_db.get('year')}).\n\n" + \
+                           get_text("welcome_existing_user_2", lang_code) + "\n" + \
+                           get_text("menu_mydata", lang_code) + "\n" + \
+                           get_text("menu_deletedata", lang_code)
+            await update.message.reply_html(welcome_text, reply_markup=get_main_menu_keyboard(lang_code))
+            return ConversationHandler.END # ვასრულებთ საუბარს, რადგან მომხმარებელს უკვე აქვს ყველაფერი
+        else: # ენა არჩეულია, მაგრამ რუკა არ არის
+            await update.message.reply_text(
+                get_text("welcome_new_user", lang_code),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text("create_chart_button_text", lang_code), callback_data="initiate_chart_creation")]])
+            )
+            return LANG_CHOICE # ვრჩებით ენის არჩევის მდგომარეობაში, რათა ღილაკმა იმუშაოს
+    else:
+        # ენის ასარჩევი ღილაკები
+        keyboard = [
+            [InlineKeyboardButton("🇬🇪 ქართული", callback_data="lang_ka")],
+            [InlineKeyboardButton("🇺🇸 English", callback_data="lang_en")],
+            [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru")],
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("აირჩიეთ ენა / Choose language / Выберите язык:", reply_markup=reply_markup)
+        return LANG_CHOICE
+
+async def handle_language_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handles language selection from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+    lang_code = query.data.split('_')[1] # "lang_ka" -> "ka"
+    context.user_data['lang_code'] = lang_code
+    user_id = query.from_user.id
+
+    # ვინახავთ ენას ბაზაში (თუ მომხმარებელი უკვე არსებობს, ვანახლებთ, თუ არა - ვქმნით)
+    # ამისთვის შეიძლება დაგვჭირდეს save_user_data-ს მცირედი მოდიფიკაცია ან ცალკე ფუნქცია
+    # ამ ეტაპზე, დავუშვათ, რომ ენას ვინახავთ user_data-ში სესიისთვის, და ბაზაში შეინახება რუკის მონაცემებთან ერთად
+    
+    logger.info(f"User {user_id} selected language: {lang_code}")
+    await query.edit_message_text(text=get_text("language_chosen", lang_code))
+
+    # შევამოწმოთ, ხომ არ აქვს მომხმარებელს უკვე შენახული რუკა
+    user_data_db = get_user_data(user_id)
+    if user_data_db and user_data_db.get('full_chart_text'):
+        # თუ რუკა არსებობს, ვაჩვენებთ მენიუს
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=get_text("main_menu_text", lang_code),
+            reply_markup=get_main_menu_keyboard(lang_code)
+        )
+        return ConversationHandler.END
+    else:
+        # თუ რუკა არ არსებობს, ვიწყებთ მისი შექმნის პროცესს
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=get_text("welcome_new_user", lang_code),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(get_text("create_chart_button_text", lang_code), callback_data="initiate_chart_creation")]])
+        )
+        return LANG_CHOICE # ვრჩებით ამ მდგომარეობაში, სანამ "რუკის შედგენა" ღილაკს არ დააჭერს
+
+async def initiate_chart_creation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Called when 'Create Chart' button is pressed after language selection or if no data."""
+    query = update.callback_query
+    await query.answer()
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    
+    await query.edit_message_text(text=get_text("chart_creation_prompt", lang_code))
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=get_text("ask_name", lang_code),
+        reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True)
+    )
+    return NAME
+
+# Conversation states
+# (NAME, BIRTH_DATE, BIRTH_TIME, COUNTRY, CITY, SAVED_DATA_CHOICE_CONV) = range(LANG_CHOICE + 1, LANG_CHOICE + 1 + 6)
+# უფრო მარტივად
+NAME_CONV, BIRTH_DATE_CONV, BIRTH_TIME_CONV, COUNTRY_CONV, CITY_CONV, SAVED_DATA_CHOICE_CONV = range(LANG_CHOICE + 1, LANG_CHOICE + 1 + 6)
+
+
+async def create_chart_start_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the conversation to create a natal chart (called by /createchart or menu button)."""
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code') # ენა უკვე არჩეული უნდა იყოს /start-ით
+    if not lang_code: # თუ /start არ გამოუყენებია და პირდაპირ /createchart მოვიდა
+        await update.message.reply_text("გთხოვთ, ჯერ გამოიყენოთ /start ბრძანება ენის ასარჩევად.")
+        return ConversationHandler.END
+
+    logger.info(f"User {user_id} started chart creation process (lang: {lang_code}).")
+    context.user_data.clear() # ვასუფთავებთ წინა დროებით მონაცემებს (ენის გარდა)
+    context.user_data['lang_code'] = lang_code # აღვადგენთ ენას
+
     saved_data = get_user_data(user_id)
-    if saved_data:
+    if saved_data and saved_data.get('full_chart_text'):
         reply_markup = InlineKeyboardMarkup([
-            [InlineKeyboardButton("კი, გამოვიყენოთ შენახული", callback_data="use_saved_data")],
-            [InlineKeyboardButton("არა, შევიყვანოთ ახალი", callback_data="enter_new_data")],
-            [InlineKeyboardButton("გაუქმება", callback_data="cancel_creation")],
+            [InlineKeyboardButton(get_text("use_saved_chart_button", lang_code), callback_data="use_saved_chart_conv")],
+            [InlineKeyboardButton(get_text("enter_new_data_button", lang_code), callback_data="enter_new_data_conv")],
+            [InlineKeyboardButton(get_text("cancel_creation_button", lang_code), callback_data="cancel_creation_conv")],
         ])
         await update.message.reply_text(
-            f"თქვენ უკვე შენახული გაქვთ მონაცემები (<b>{saved_data.get('name', '?')}</b>, {saved_data.get('day','?')}/{saved_data.get('month','?')}/{saved_data.get('year', '?')}...). "
-            "გსურთ ამ მონაცემებით რუკის შედგენა?",
-            reply_markup=reply_markup,
-            parse_mode=ParseMode.HTML
+            get_text("saved_data_exists_1", lang_code).format(name=saved_data.get('name','?'), day=saved_data.get('day','?'), month=saved_data.get('month','?'), year=saved_data.get('year','?')) + "\n" +
+            get_text("saved_data_exists_2", lang_code),
+            reply_markup=reply_markup
         )
-        return SAVED_DATA_CHOICE
+        return SAVED_DATA_CHOICE_CONV
     else:
         await update.message.reply_text(
-            "ნატალური რუკის შესაქმნელად, მჭირდება თქვენი მონაცემები.\n"
-            "შეგიძლიათ ნებისმიერ დროს შეწყვიტოთ პროცესი /cancel ბრძანებით.\n\n"
-            "გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:"
+            get_text("chart_creation_prompt", lang_code) + "\n\n" +
+            get_text("ask_name", lang_code),
+            reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True)
         )
-        return NAME
+        return NAME_CONV
 
-async def handle_saved_data_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_saved_data_choice_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     choice = query.data
-    if choice == "use_saved_data":
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+
+    if choice == "use_saved_chart_conv":
         saved_data = get_user_data(user_id)
-        if saved_data:
-            await query.edit_message_text("გამოვიყენებ შენახულ მონაცემებს რუკის შესადგენად.")
-            await generate_and_send_chart(saved_data, query.message.chat_id, context)
-            context.user_data.clear()
+        if saved_data and saved_data.get('full_chart_text'):
+            await query.edit_message_text(get_text("using_saved_chart", lang_code))
+            parts = split_text(saved_data['full_chart_text'])
+            for part in parts:
+                await context.bot.send_message(chat_id=query.message.chat_id, text=part, parse_mode=ParseMode.HTML)
+            await context.bot.send_message(chat_id=query.message.chat_id, text=get_text("main_menu_text", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
             return ConversationHandler.END
-        else:
-            await query.edit_message_text("შენახული მონაცემები ვერ მოიძებნა. ვიწყებ ახლის შეგროვებას.")
-            await query.message.reply_text("გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:")
-            return NAME
-    elif choice == "enter_new_data":
-        await query.edit_message_text("კარგი, შევიყვანოთ ახალი მონაცემები.")
-        await query.message.reply_text("გთხოვთ, შეიყვანოთ სახელი, ვისთვისაც ვადგენთ რუკას:")
-        return NAME
-    elif choice == "cancel_creation":
-        await query.edit_message_text("რუკის შექმნა გაუქმებულია.")
-        context.user_data.clear()
+        else: # ეს არ უნდა მოხდეს ლოგიკურად
+            await query.edit_message_text("შენახული რუკა ვერ მოიძებნა. ვიწყებ ახალი მონაცემების შეგროვებას.")
+            await query.message.reply_text(get_text("ask_name", lang_code), reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True))
+            return NAME_CONV
+    elif choice == "enter_new_data_conv":
+        await query.edit_message_text(get_text("enter_new_data_button", lang_code) + "...") # "არა, შევიყვანოთ ახალი მონაცემები." -> "კარგი, შევიყვანოთ..."
+        await query.message.reply_text(get_text("ask_name", lang_code), reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True))
+        return NAME_CONV
+    elif choice == "cancel_creation_conv":
+        await query.edit_message_text(get_text("chart_generation_cancelled", lang_code))
+        await query.message.reply_text(get_text("main_menu_text", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
         return ConversationHandler.END
-    else: # Should not happen
-        await query.edit_message_text("არასწორი არჩევანი. გთხოვთ, სცადოთ თავიდან /createchart.")
-        context.user_data.clear()
-        return ConversationHandler.END
+    return ConversationHandler.END
 
-async def handle_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_name_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
     user_name_input = update.message.text
-    if not user_name_input or len(user_name_input) < 2:
-         await update.message.reply_text("გთხოვთ, შეიყვანოთ კორექტული სახელი (მინ. 2 სიმბოლო).")
-         return NAME
-    context.user_data['name'] = user_name_input
-    logger.info(f"User {update.effective_user.id} entered name: {user_name_input}")
-    await update.message.reply_text(f"გმადლობთ, {user_name_input}. ახლა გთხოვთ, შეიყვანოთ დაბადების წელი (მაგ., 1990):")
-    return YEAR
+    if not user_name_input or len(user_name_input.strip()) < 2:
+         await update.message.reply_text(get_text("invalid_name", lang_code))
+         return NAME_CONV
+    context.user_data['name'] = user_name_input.strip()
+    logger.info(f"User {update.effective_user.id} entered name: {context.user_data['name']}")
+    await update.message.reply_text(get_text("name_thanks", lang_code).format(name=context.user_data['name']), parse_mode=ParseMode.HTML)
+    return BIRTH_DATE_CONV
 
-async def handle_year(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_birth_date_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    date_text = update.message.text.strip()
     try:
-        year = int(update.message.text)
+        dt_obj = None
+        possible_formats = ["%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d"]
+        for fmt in possible_formats:
+            try:
+                dt_obj = datetime.strptime(date_text, fmt)
+                break
+            except ValueError:
+                continue
+        if not dt_obj: raise ValueError("Date format not recognized")
+
         current_year = datetime.now().year
-        if 1900 <= year <= current_year:
-            context.user_data['year'] = year
-            logger.info(f"User {update.effective_user.id} entered year: {year}")
-            await update.message.reply_text("შეიყვანეთ დაბადების თვე (რიცხვი 1-დან 12-მდე):")
-            return MONTH
-        else:
-            await update.message.reply_text(f"გთხოვთ, შეიყვანოთ კორექტული წელი ({1900}-{current_year}).")
-            return YEAR
-    except ValueError:
-        await update.message.reply_text("გთხოვთ, შეიყვანოთ წელი რიცხვებით (მაგ., 1990).")
-        return YEAR
+        if not (1900 <= dt_obj.year <= current_year):
+            await update.message.reply_text(get_text("invalid_year_range", lang_code).format(start_year=1900, end_year=current_year), parse_mode=ParseMode.HTML)
+            return BIRTH_DATE_CONV
 
-async def handle_month(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        month = int(update.message.text)
-        if 1 <= month <= 12:
-            context.user_data['month'] = month
-            logger.info(f"User {update.effective_user.id} entered month: {month}")
-            await update.message.reply_text("შეიყვანეთ დაბადების რიცხვი:")
-            return DAY
-        else:
-            await update.message.reply_text("გთხოვთ, შეიყვანოთ თვე რიცხვით 1-დან 12-მდე.")
-            return MONTH
+        context.user_data['year'] = dt_obj.year
+        context.user_data['month'] = dt_obj.month
+        context.user_data['day'] = dt_obj.day
+        logger.info(f"User {update.effective_user.id} entered date: Y:{dt_obj.year}, M:{dt_obj.month}, D:{dt_obj.day}")
+        reply_markup = ReplyKeyboardMarkup(
+            [[KeyboardButton(get_text("time_unknown_button", lang_code)), KeyboardButton(get_text("cancel_button_text", lang_code))]],
+            resize_keyboard=True, one_time_keyboard=True
+        )
+        await update.message.reply_text(get_text("ask_time", lang_code), reply_markup=reply_markup, parse_mode=ParseMode.HTML)
+        return BIRTH_TIME_CONV
     except ValueError:
-        await update.message.reply_text("გთხოვთ, შეიყვანოთ თვე რიცხვით (1-12).")
-        return MONTH
+        await update.message.reply_text(get_text("invalid_date_format", lang_code), parse_mode=ParseMode.HTML)
+        return BIRTH_DATE_CONV
 
-async def handle_day(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        day = int(update.message.text)
-        # აქ შეიძლება დავამატოთ უფრო რთული ვალიდაცია თვის მიხედვით (30/31 დღე, ნაკიანი წელი)
-        if 1 <= day <= 31:
-            context.user_data['day'] = day
-            logger.info(f"User {update.effective_user.id} entered day: {day}")
-            await update.message.reply_text("შეიყვანეთ დაბადების საათი (0-დან 23-მდე, თუ არ იცით, შეიყვანეთ 12):")
-            return HOUR
-        else:
-            await update.message.reply_text("გთხოვთ, შეიყვანოთ რიცხვი 1-დან 31-მდე.")
-            return DAY
-    except ValueError:
-        await update.message.reply_text("გთხოვთ, შეიყვანოთ რიცხვი.")
-        return DAY
+async def handle_birth_time_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    time_text = update.message.text.strip()
 
-async def handle_hour(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        hour = int(update.message.text)
-        if 0 <= hour <= 23:
-            context.user_data['hour'] = hour
-            logger.info(f"User {update.effective_user.id} entered hour: {hour}")
-            await update.message.reply_text("შეიყვანეთ დაბადების წუთი (0-დან 59-მდე):")
-            return MINUTE
-        else:
-            await update.message.reply_text("გთხოვთ, შეიყვანოთ საათი 0-დან 23-მდე.")
-            return HOUR
-    except ValueError:
-        await update.message.reply_text("გთხოვთ, შეიყვანოთ საათი რიცხვით (0-23).")
-        return HOUR
+    if time_text == get_text("time_unknown_button", lang_code):
+        context.user_data['hour'] = DEFAULT_UNKNOWN_TIME.hour
+        context.user_data['minute'] = DEFAULT_UNKNOWN_TIME.minute
+        logger.info(f"User {update.effective_user.id} selected unknown time, using default: {DEFAULT_UNKNOWN_TIME.hour}:{DEFAULT_UNKNOWN_TIME.minute}")
+    else:
+        try:
+            time_obj = datetime.strptime(time_text, "%H:%M").time()
+            context.user_data['hour'] = time_obj.hour
+            context.user_data['minute'] = time_obj.minute
+            logger.info(f"User {update.effective_user.id} entered time: H:{time_obj.hour}, M:{time_obj.minute}")
+        except ValueError:
+            await update.message.reply_text(get_text("invalid_time_format", lang_code), parse_mode=ParseMode.HTML)
+            return BIRTH_TIME_CONV
+    await update.message.reply_text(get_text("ask_country", lang_code), reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True))
+    return COUNTRY_CONV
 
-async def handle_minute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        minute = int(update.message.text)
-        if 0 <= minute <= 59:
-            context.user_data['minute'] = minute
-            logger.info(f"User {update.effective_user.id} entered minute: {minute}")
-            await update.message.reply_text("შეიყვანეთ დაბადების ქალაქი (მაგ., Tbilisi, Kutaisi):")
-            return CITY
-        else:
-            await update.message.reply_text("გთხოვთ, შეიყვანოთ წუთი 0-დან 59-მდე.")
-            return MINUTE
-    except ValueError:
-        await update.message.reply_text("გთხოვთ, შეიყვანოთ წუთი რიცხვით (0-59).")
-        return MINUTE
+async def handle_country_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    country_text = update.message.text.strip()
+    if not country_text or len(country_text) < 2 :
+        await update.message.reply_text(get_text("invalid_country", lang_code))
+        return COUNTRY_CONV
+    context.user_data['nation_full_name'] = country_text # ვინახავთ სრულ სახელს
+    context.user_data['nation'] = None # Kerykeion-ი შეეცდება გამოიცნოს, ან შეგვიძლია დავამატოთ კოდის ძებნა
+    logger.info(f"User {update.effective_user.id} entered country: {country_text}")
+    await update.message.reply_text(get_text("ask_city", lang_code).format(country=country_text), reply_markup=ReplyKeyboardMarkup([[KeyboardButton(get_text("cancel_button_text", lang_code))]], resize_keyboard=True, one_time_keyboard=True))
+    return CITY_CONV
 
-async def handle_city(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    city = update.message.text
+async def handle_city_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    city = update.message.text.strip()
     if not city or len(city) < 2:
-         await update.message.reply_text("გთხოვთ, შეიყვანოთ კორექტული ქალაქის სახელი.")
-         return CITY
-    context.user_data['city'] = city.strip()
-    logger.info(f"User {update.effective_user.id} entered city: {city.strip()}")
-    await update.message.reply_text("შეიყვანეთ ქვეყნის კოდი (სურვილისამებრ, მაგ., GE, US, GB), ან გამოტოვეთ /skip ბრძანებით:")
-    return NATION
+         await update.message.reply_text(get_text("invalid_city", lang_code))
+         return CITY_CONV
+    context.user_data['city'] = city
+    logger.info(f"User {user_id} entered city: {city}")
 
-async def handle_nation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    nation_input = update.message.text.strip().upper()
-    user_id = update.effective_user.id
-    chat_id = update.message.chat_id
-    if len(nation_input) < 2 or len(nation_input) > 3 or not nation_input.isalpha():
-         await update.message.reply_text("არასწორი ქვეყნის კოდის ფორმატი. გთხოვთ, შეიყვანოთ 2 ან 3 ასო (მაგ., GE) ან /skip.")
-         return NATION
-    context.user_data['nation'] = nation_input
-    logger.info(f"User {update.effective_user.id} entered nation: {nation_input}")
-    if save_user_data(user_id, context.user_data):
-        await update.message.reply_text("მონაცემები შენახულია.")
-    else:
-        await update.message.reply_text("მონაცემების შენახვისას მოხდა შეცდომა.")
-    await generate_and_send_chart(context.user_data, chat_id, context)
-    context.user_data.clear()
-    logger.info(f"Conversation ended for user {user_id}.")
+    await update.message.reply_text(get_text("data_collection_complete", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+
+    save_user_data(user_id, context.user_data, chart_text=None) # ვინახავთ საბაზისო მონაცემებს, რუკა ჯერ არ არის
+    # რუკის გენერაცია
+    await generate_and_send_chart(user_id, update.message.chat_id, context, is_new_data=True)
+    # context.user_data.clear() # ვასუფთავებთ მხოლოდ კონვერსაციის ბოლოს
+    # logger.info(f"Conversation ended for user {user_id}.")
     return ConversationHandler.END
 
-async def skip_nation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user_id = update.effective_user.id
-    chat_id = update.message.chat_id
-    logger.info(f"User {user_id} skipped nation input.")
-    context.user_data['nation'] = None
-    if save_user_data(user_id, context.user_data):
-        await update.message.reply_text("მონაცემები შენახულია (ქვეყნის გარეშე).")
-    else:
-        await update.message.reply_text("მონაცემების შენახვისას მოხდა შეცდომა.")
-    await generate_and_send_chart(context.user_data, chat_id, context)
-    context.user_data.clear()
-    logger.info(f"Conversation ended for user {user_id}.")
-    return ConversationHandler.END
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def cancel_conv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
     logger.info(f"User {user.id} canceled the conversation.")
-    context.user_data.clear()
-    await update.message.reply_text('მონაცემების შეყვანის პროცესი გაუქმებულია.')
+    context.user_data.clear() # ვასუფთავებთ დროებით მონაცემებს
+    await update.message.reply_text(
+        get_text("chart_generation_cancelled", lang_code),
+        reply_markup=get_main_menu_keyboard(lang_code)
+    )
     return ConversationHandler.END
 
-async def show_my_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# --- სხვა ბრძანებები ---
+async def my_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
      user_id = update.effective_user.id
-     user_data = get_user_data(user_id)
-     if user_data:
-         text = "თქვენი შენახული მონაცემებია:\n"
-         text += f"  <b>სახელი:</b> {user_data.get('name', '-')}\n"
-         text += f"  <b>თარიღი:</b> {user_data.get('day', '-')}/{user_data.get('month', '-')}/{user_data.get('year', '-')}\n"
-         text += f"  <b>დრო:</b> {user_data.get('hour', '-')}:{user_data.get('minute', '-')}\n"
-         text += f"  <b>ქალაქი:</b> {user_data.get('city', '-')}\n"
-         text += f"  <b>ქვეყანა:</b> {user_data.get('nation') or 'არ არის მითითებული'}"
-         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-     else:
-         await update.message.reply_text("თქვენ არ გაქვთ შენახული მონაცემები. გამოიყენეთ /createchart დასამატებლად.")
+     lang_code = context.user_data.get('lang_code')
+     # ვცდილობთ ენის წამოღებას ბაზიდან, თუ სესიაში არ არის
+     if not lang_code:
+         user_db_data = get_user_data(user_id)
+         if user_db_data and user_db_data.get('language_code'):
+             lang_code = user_db_data['language_code']
+             context.user_data['lang_code'] = lang_code # ვინახავთ სესიისთვისაც
+         else:
+             lang_code = DEFAULT_LANGUAGE
 
-async def delete_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     user_data = get_user_data(user_id) # ვკითხულობთ მონაცემებს ბაზიდან
+     if user_data:
+         text = get_text("my_data_header", lang_code)
+         text += get_text("my_data_name", lang_code).format(name=user_data.get('name', '-'))
+         text += get_text("my_data_date", lang_code).format(day=user_data.get('day', '-'), month=user_data.get('month', '-'), year=user_data.get('year', '-'))
+         text += get_text("my_data_time", lang_code).format(hour=user_data.get('hour', '-'), minute=user_data.get('minute', '-'))
+         text += get_text("my_data_city", lang_code).format(city=user_data.get('city', '-'))
+         text += get_text("my_data_country", lang_code).format(nation_or_text=user_data.get('nation') or get_text("not_specified", lang_code))
+         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=get_main_menu_keyboard(lang_code))
+     else:
+         await update.message.reply_text(get_text("no_data_found", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+
+async def view_my_chart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
-    if delete_user_data(user_id):
-        await update.message.reply_text("თქვენი შენახული მონაცემები წარმატებით წაიშალა.")
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE) # ენა სესიიდან ან დეფოლტი
+    user_data_from_db = get_user_data(user_id)
+
+    if user_data_from_db and user_data_from_db.get('full_chart_text'):
+        await update.message.reply_text(get_text("using_saved_chart", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+        parts = split_text(user_data_from_db['full_chart_text'])
+        for part in parts:
+            await context.bot.send_message(chat_id=update.effective_chat.id, text=part, parse_mode=ParseMode.HTML)
+    elif user_data_from_db:
+        await update.message.reply_text("თქვენი მონაცემები შენახულია, მაგრამ რუკა ჯერ არ არის გენერირებული. ვიწყებ გენერაციას...", reply_markup=get_main_menu_keyboard(lang_code))
+        await generate_and_send_chart(user_id, update.effective_chat.id, context, is_new_data=True)
     else:
-        await update.message.reply_text("მონაცემების წაშლისას მოხდა შეცდომა ან მონაცემები არ არსებობდა.")
+        await update.message.reply_text("ჯერ რუკა უნდა შეადგინოთ. გთხოვთ, აირჩიეთ '📜 რუკის შედგენა' ან გამოიყენეთ /createchart.", reply_markup=get_main_menu_keyboard(lang_code))
+
+
+async def delete_data_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    if delete_user_data(user_id):
+        await update.message.reply_text(get_text("data_deleted_success", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+    else:
+        await update.message.reply_text(get_text("data_delete_error", lang_code), reply_markup=get_main_menu_keyboard(lang_code))
+
+async def handle_other_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    button_text = update.message.text
+    lang_code = context.user_data.get('lang_code', DEFAULT_LANGUAGE)
+    # ვცდილობთ ვიპოვოთ ღილაკის ტექსტის შესაბამისი გასაღები, რომ ავიღოთ ინგლისური სახელი
+    feature_name_en = button_text # Default
+    for lc, trans_dict in translations.items():
+        for key, value in trans_dict.items():
+            if value == button_text:
+                 feature_name_en = translations["en"].get(key, button_text) # ვიღებთ ინგლისურს
+                 break
+        if feature_name_en != button_text:
+            break
+            
+    await update.message.reply_text(
+        get_text("feature_coming_soon", lang_code).format(feature_name=feature_name_en),
+        reply_markup=get_main_menu_keyboard(lang_code)
+    )
 
 # --- მთავარი ფუნქცია ---
 def main() -> None:
@@ -662,39 +597,70 @@ def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("Error: TELEGRAM_BOT_TOKEN environment variable not set. Bot cannot start.")
         return
-    if not gemini_model: # შევამოწმოთ მოდელი ჩაიტვირთა თუ არა
+    if not gemini_model:
          logger.warning("Gemini model not loaded (check API key and safety settings?). AI features will be disabled in responses.")
 
     logger.info("Creating application...")
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
+    # Conversation Handler for language selection AND chart creation
+    # LANG_CHOICE will be the first state for new users or if /start is called
+    # Chart creation flow (NAME_CONV, etc.) will follow after language is set
+    # or if user directly requests chart and language is already known.
+
     conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('createchart', create_chart_start)],
+        entry_points=[
+            CommandHandler('start', start_command), # /start ბრძანება იწყებს ენის არჩევის პროცესს
+            CommandHandler('createchart', create_chart_start_conv), # /createchart პირდაპირ იწყებს რუკის შედგენას (თუ ენა ცნობილია)
+            # CallbackQueryHandler-ი "რუკის შედგენა" ღილაკისთვის /start-ის შემდეგ
+            CallbackQueryHandler(initiate_chart_creation_callback, pattern='^initiate_chart_creation$'),
+            MessageHandler(filters.Regex(f'^{re.escape(get_text("create_chart_button_text", "ka"))}$|^{re.escape(get_text("create_chart_button_text", "en"))}$|^{re.escape(get_text("create_chart_button_text", "ru"))}$'), create_chart_start_conv)
+        ],
         states={
-            SAVED_DATA_CHOICE: [
-                 CallbackQueryHandler(handle_saved_data_choice, pattern='^(use_saved_data|enter_new_data|cancel_creation)$')
+            LANG_CHOICE: [
+                CallbackQueryHandler(handle_language_choice, pattern='^lang_(ka|en|ru)$'),
+                # ესეც საჭიროა, თუ /start-ის მერე ღილაკს დააჭერენ
+                CallbackQueryHandler(initiate_chart_creation_callback, pattern='^initiate_chart_creation$')
             ],
-            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name)],
-            YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_year)],
-            MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_month)],
-            DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_day)],
-            HOUR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hour)],
-            MINUTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_minute)],
-            CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city)],
-            NATION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_nation),
-                CommandHandler('skip', skip_nation)
+            SAVED_DATA_CHOICE_CONV: [
+                 CallbackQueryHandler(handle_saved_data_choice_conv, pattern='^(use_saved_chart_conv|enter_new_data_conv|cancel_creation_conv)$')
             ],
+            NAME_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_name_conv)],
+            BIRTH_DATE_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_birth_date_conv)],
+            BIRTH_TIME_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_birth_time_conv)],
+            COUNTRY_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_country_conv)],
+            CITY_CONV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_city_conv)],
         },
-        fallbacks=[CommandHandler('cancel', cancel)],
+        fallbacks=[CommandHandler('cancel', cancel_conv)],
+        # persistent=True, name="main_conversation" # მოგვიანებით შეგვიძლია დავამატოთ
+        allow_reentry=True # მნიშვნელოვანია, რომ /start და /createchart ხელახლა მუშაობდეს
     )
 
     application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("mydata", show_my_data))
-    application.add_handler(CommandHandler("deletedata", delete_data))
+    # Commands outside conversation (start is an entry point now)
+    application.add_handler(CommandHandler("mydata", my_data_command))
+    application.add_handler(CommandHandler("deletedata", delete_data_command))
 
-    logger.info("Handlers registered (Conversation, start, mydata, deletedata).")
+    # Handlers for main menu buttons (using Regex to match text)
+    application.add_handler(MessageHandler(filters.Regex(f'^{re.escape(get_text("main_menu_button_view_chart", "ka"))}$|^{re.escape(get_text("main_menu_button_view_chart", "en"))}$|^{re.escape(get_text("main_menu_button_view_chart", "ru"))}$'), view_my_chart_command))
+    # დანარჩენი მენიუს ღილაკები
+    other_buttons_texts = [
+        get_text("main_menu_button_dream", lang) for lang in ["ka", "en", "ru"]
+    ] + [
+        get_text("main_menu_button_horoscope", lang) for lang in ["ka", "en", "ru"]
+    ] + [
+        get_text("main_menu_button_palmistry", lang) for lang in ["ka", "en", "ru"]
+    ] + [
+        get_text("main_menu_button_coffee", lang) for lang in ["ka", "en", "ru"]
+    ] + [
+        get_text("main_menu_button_help", lang) for lang in ["ka", "en", "ru"]
+    ]
+    # გავაერთიანოთ Regex OR-ით
+    other_buttons_regex = '^(' + '|'.join(re.escape(text) for text in set(other_buttons_texts)) + ')$'
+    application.add_handler(MessageHandler(filters.Regex(other_buttons_regex), handle_other_menu_buttons))
+
+
+    logger.info("Handlers registered.")
     logger.info("Starting bot polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
