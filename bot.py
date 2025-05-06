@@ -235,11 +235,21 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
 
     try:
         if not GEONAMES_USERNAME:
-            logger.warning("GEONAMES_USERNAME not set in .env. Kerykeion will use default, which can be unreliable.")
-            await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: GeoNames მომხმარებლის სახელი არ არის დაყენებული. ქალაქის ძებნა შეიძლება ვერ მოხერხდეს ან არასწორი იყოს. რეკომენდებულია მისი დამატება.")
+        logger.warning("GEONAMES_USERNAME not set in .env. Kerykeion will use default, which can be unreliable.")
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ გაფრთხილება: GeoNames მომხმარებლის სახელი არ არის დაყენებული...")
+        # ...
+
+    logger.info(f"Calling AstrologicalSubject with geonames_username='{GEONAMES_USERNAME}'")
+    try:
+        subject_instance = await asyncio.to_thread(
+            AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME # <-- აქ გადავცემთ
+        )
+    except RuntimeError:
+         logger.warning(f"asyncio.to_thread failed, calling Kerykeion directly.")
+         subject_instance = AstrologicalSubject(name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME)
 
         logger.info(f"Calling AstrologicalSubject with geonames_username='{GEONAMES_USERNAME}'")
-        try:
+    try:
             subject_instance = await asyncio.to_thread(
                 AstrologicalSubject, name, year, month, day, hour, minute, city, nation=nation, geonames_username=GEONAMES_USERNAME
             )
@@ -249,9 +259,9 @@ async def generate_and_send_chart(user_data: dict, chat_id: int, context: Contex
         logger.info(f"Kerykeion data generated for {name}. Sun at {subject_instance.sun['position']:.2f} {subject_instance.sun['sign']}.")
 
         # --- ასპექტების გამოთვლა (შესწორებული) ---
-        logger.info("Calculating aspects...")
-        aspects_data_str_for_prompt = ""
-        try:
+    logger.info("Calculating aspects...")
+    aspects_data_str_for_prompt = ""
+    try:
             # Kerykeion-ის NatalAspects სწორად გამოძახება
             aspect_calculator = NatalAspects(
                 subject_instance,
